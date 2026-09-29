@@ -1,0 +1,41 @@
+Checks: >
+  -*,
+  readability-*,
+  bugprone-*,
+  -readability-magic-numbers,
+  -readability-identifier-length,
+  -bugprone-easily-swappable-parameters
+
+WarningsAsErrors: ""
+
+HeaderFilterRegex: "^(src|include)/.*"
+
+CheckOptions:
+  # HAL functions: Module_Action -> PascalCase (HAL_UART_Init, MX_GPIO_Init)
+  - key: readability-identifier-naming.FunctionCase
+    value: aNy_CasE
+
+  # Variables: camelCase (uartBusy, adcBuffer)
+  - key: readability-identifier-naming.VariableCase
+    value: camelCase
+  - key: readability-identifier-naming.ParameterCase
+    value: camelCase
+  - key: readability-identifier-naming.LocalVariableCase
+    value: camelCase
+
+  # Macros and constants: UPPER_CASE (ADC_BUF_SIZE, GPIO_PIN_0)
+  - key: readability-identifier-naming.MacroDefinitionCase
+    value: UPPER_CASE
+  - key: readability-identifier-naming.EnumConstantCase
+    value: UPPER_CASE
+
+  # Structs/typedefs: PascalCase (ADC_HandleTypeDef, GPIO_InitTypeDef)
+  - key: readability-identifier-naming.TypedefCase
+    value: aNy_CasE
+  - key: readability-identifier-naming.StructCase
+    value: aNy_CasE
+
+  - key: readability-function-cognitive-complexity.Threshold
+    value: 50
+  - key: readability-function-cognitive-complexity.IgnoreMacros
+    value: 'true'

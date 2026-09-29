@@ -3,3 +3,7 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+build
+compile_commands.json
+managed_components
+sdkconfig.*.old

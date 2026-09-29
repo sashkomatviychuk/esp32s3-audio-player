@@ -1,0 +1,25 @@
+CompileFlags:
+  CompilationDatabase: .
+  Add:
+    - -ferror-limit=0
+  Remove:
+    - -mlongcalls
+    - -mtext-section-literals
+    - -fstrict-volatile-bitfields
+    - -fno-tree-switch-conversion
+    - -mfix-esp32-psram-cache-issue
+    - -mfix-esp32-psram-cache-strategy=*
+    - -std=gnu++11
+    - -std=gnu++14
+    - -w
+    - -fno-shrink-wrap
+    - -fzero-init-padding-bits=*
+    - -fno-malloc-dce
+
+Diagnostics:
+  Suppress:
+    - pp_file_not_found
+    - err_file_not_found
+
+Index:
+  Background: Build
