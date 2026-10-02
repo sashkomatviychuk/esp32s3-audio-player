@@ -1,5 +1,6 @@
 #include "audio_task.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -7,8 +8,8 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/task.h"
-#include "player_state.h"
 #include "mp3_info.h"
+#include "player_state.h"
 #include "player_types.h"
 #include "sd_card.h"
 #include "vs1053.h"
@@ -18,8 +19,8 @@ static const char* TAG = "audio_task";
 #define CHUNK_SIZE 32  // VS1053: 32-byte chunks over SPI
 #define AUDIO_TASK_STACK_SIZE 4096
 #define AUDIO_TASK_PRIORITY 5
-#define PROGRESS_UPDATE_PERIOD_US 500000  // how often elapsed time is read from the codec
-#define MAX_CONSECUTIVE_CODEC_ERRORS 10  // stop playback if VS1053 stays unresponsive
+#define PROGRESS_UPDATE_PERIOD_US 500000  // how often elapsed time is published
+#define MAX_CONSECUTIVE_CODEC_ERRORS 10   // stop playback if VS1053 stays unresponsive
 
 // AUDIO_DEBUG_MODE / AUDIO_DEBUG_FILENAME are defined in audio_task.h
 
@@ -130,16 +131,20 @@ static track_result_t stream_current_track(void) {
 
   ESP_LOGI(TAG, "Streaming %s", path);
 
-  // Track length for the display. Reads the file head, so it needs spi_mutex
-  // (the SD card shares the bus with the VS1053).
-  uint32_t durationSec = 0;
+  // Track length and bitrate for the display. Reads the file head, so it
+  // needs spi_mutex (the SD card shares the bus with the VS1053).
+  mp3_info_t info = {0};
   struct stat st;
   if (stat(path, &st) == 0 && xSemaphoreTake(s_spi_mutex, portMAX_DELAY) == pdTRUE) {
-    durationSec = mp3_get_duration_sec(f, (size_t)st.st_size);
+    mp3_get_info(f, (size_t)st.st_size, &info);
     xSemaphoreGive(s_spi_mutex);
   }
-  vs1053_reset_decode_time();  // takes spi_mutex internally
-  player_state_set_progress(0, durationSec);
+  // Elapsed time is derived from the bytes handed to the codec (the VS1053
+  // decode-time register is not usable while the decoder does not lock on).
+  // DREQ paces the transfer, so this follows real playback; pause is
+  // accounted for automatically because no bytes are sent while paused.
+  uint64_t bytesSent = 0;
+  player_state_set_progress(0, info.duration_sec);
   int64_t lastProgressUs = esp_timer_get_time();
 
   player_state_set_playback(PLAYBACK_PLAYING);
@@ -171,6 +176,9 @@ static track_result_t stream_current_track(void) {
   int chunks_sent = 0;
   int total_chunks_logged = 0;
   track_result_t result = TRACK_FINISHED;
+  bool reachedEof = false;
+  bool read_error = false;  // the loop ended on an SD read error, not a real EOF
+  int read_errno = 0;
 #define DECODE_STATUS_LOG_EVERY_N_CHUNKS 200  // ~every 1.5s of audio at 128kbps
 
   while (1) {
@@ -211,7 +219,15 @@ static track_result_t stream_current_track(void) {
       read_buf_pos = 0;
 
       if (read_buf_len == 0) {
-        break;  // end of file
+        // fread() returns 0 both at a real EOF and on a read error (e.g. an SD
+        // CRC failure) — ferror() tells them apart.
+        if (ferror(f)) {
+          read_error = true;
+          read_errno = errno;
+        } else {
+          reachedEof = true;
+        }
+        break;
       }
     }
 
@@ -235,12 +251,11 @@ static track_result_t stream_current_track(void) {
     }
 
     // --- Publish the playback position for the display ---
-    if (esp_timer_get_time() - lastProgressUs >= PROGRESS_UPDATE_PERIOD_US) {
+    if (info.bitrate_bps > 0 &&
+        esp_timer_get_time() - lastProgressUs >= PROGRESS_UPDATE_PERIOD_US) {
       lastProgressUs = esp_timer_get_time();
-      uint16_t decodedSec = 0;
-      if (vs1053_get_decode_time(&decodedSec) == ESP_OK) {  // takes spi_mutex internally
-        player_state_set_progress(decodedSec, durationSec);
-      }
+      uint64_t audioBytes = bytesSent > info.audio_start ? bytesSent - info.audio_start : 0;
+      player_state_set_progress((uint32_t)(audioBytes * 8 / info.bitrate_bps), info.duration_sec);
     }
 
     // --- Send to VS1053, under the mutex for the same SPI bus ---
@@ -250,6 +265,9 @@ static track_result_t stream_current_track(void) {
       xSemaphoreGive(s_spi_mutex);
     }
     read_buf_pos += bytes_to_send;
+    if (codec_ret == ESP_OK) {
+      bytesSent += bytes_to_send;
+    }
 
     if (codec_ret != ESP_OK) {
       if (++consecutive_codec_errors >= MAX_CONSECUTIVE_CODEC_ERRORS) {
@@ -279,7 +297,17 @@ static track_result_t stream_current_track(void) {
     }
   }
 
-  ESP_LOGI(TAG, "%s", result == TRACK_CHANGED ? "Track changed, closing file" : "Done streaming file");
+  if (read_error) {
+    ESP_LOGE(TAG, "SD read error (errno %d), stopping playback", read_errno);
+  } else {
+    // The periodic update can lag up to PROGRESS_UPDATE_PERIOD_US and the byte
+  // count is rounded down, so snap to the full length once the file is done.
+  if (reachedEof && info.duration_sec > 0) {
+    player_state_set_progress(info.duration_sec, info.duration_sec);
+  }
+
+  ESP_LOGI(TAG, "%s", result == TRACK_CHANGED ? "Track changed, closing file" : "End of file");
+  }
   fclose(f);
   return result;
 }

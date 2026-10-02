@@ -3,7 +3,6 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include "driver/sdspi_host.h"
@@ -11,13 +10,6 @@
 #include "esp_vfs_fat.h"
 #include "player_state.h"
 #include "sdmmc_cmd.h"
-
-// Private ESP-IDF fatfs component header — not part of the public
-// esp_vfs_fat.h API, but exposes esp_vfs_fat_sdspi_sdcard_init() and
-// esp_vfs_fat_mount_initialized() as two separate steps. We need that split
-// to patch card->csd between them (see the CSD workaround in sd_card_init).
-// NOT guaranteed stable across ESP-IDF versions — re-verify after upgrading.
-#include "vfs_fat_internal.h"
 
 static const char* TAG = "sd_card";
 
@@ -89,51 +81,13 @@ esp_err_t sd_card_init(spi_host_device_t* out_host) {
   // once before the card responds.
   slot_config.wait_for_miso = 100;
 
-  // not using ff_memalloc here, matching what esp_vfs_fat_sdspi_mount does
-  // internally — we can't use that helper directly because it doesn't give
-  // us a chance to patch card->csd between card_init and the FatFs mount
-  // (see the CSD workaround below).
-  sdmmc_card_t* card = (sdmmc_card_t*)malloc(sizeof(sdmmc_card_t));
-  if (card == NULL) {
-    ESP_LOGE(TAG, "Failed to allocate sdmmc_card_t");
-    return ESP_ERR_NO_MEM;
-  }
-
-  bool host_inited = false;
-  ret = esp_vfs_fat_sdspi_sdcard_init(&host, &slot_config, card, &host_inited);
+  // The CSD (capacity) is read correctly now that data CRC is enforced — the
+  // earlier "512KB" CSD was an artifact of SDMMC_HOST_FLAG_SPI_IGNORE_DATA_CRC
+  // (see sd-card-issues.md), so the public mount helper is enough.
+  sdmmc_card_t* card = NULL;
+  ret = esp_vfs_fat_sdspi_mount(MOUNT_POINT, &host, &slot_config, &mount_config, &card);
   if (ret != ESP_OK) {
-    ESP_LOGE(TAG, "esp_vfs_fat_sdspi_sdcard_init failed: %s", esp_err_to_name(ret));
-    free(card);
-    return ret;
-  }
-
-  // WORKAROUND: this specific card/reader consistently returns a corrupted
-  // CSD register over SPI (csd_ver=0, capacity=1024, sector_size=512 — i.e.
-  // "512KB"), even with IGNORE_DATA_CRC and a very conservative 100kHz/100ms
-  // wait_for_miso. Reads and writes both work fine against the real flash —
-  // it's specifically the CSD decode that's wrong, so FatFs ends up
-  // formatting/mounting only the first 512KB of a 16GB card. Until this is
-  // root-caused (or the card/reader is swapped), override capacity/sector
-  // size with a conservative estimate of the card's real size so the rest of
-  // the flash is usable. 16GB card, marketing (decimal) GB, knocked down 5%
-  // for margin: 16e9 bytes / 512 * 0.95 sectors.
-  ESP_LOGW(TAG,
-           "CSD capacity looked wrong (%d sectors), overriding to %d sectors for this 16GB card",
-           card->csd.capacity, 29687500);
-  card->csd.capacity = 29687500;
-  card->csd.sector_size = 512;
-
-  ret = esp_vfs_fat_mount_initialized(card, MOUNT_POINT, &mount_config);
-  if (ret != ESP_OK) {
-    ESP_LOGE(TAG, "esp_vfs_fat_mount_initialized failed: %s", esp_err_to_name(ret));
-    if (host_inited) {
-      if (host.flags & SDMMC_HOST_FLAG_DEINIT_ARG) {
-        host.deinit_p(host.slot);
-      } else {
-        host.deinit();
-      }
-    }
-    free(card);
+    ESP_LOGE(TAG, "esp_vfs_fat_sdspi_mount failed: %s", esp_err_to_name(ret));
     return ret;
   }
 
@@ -179,7 +133,10 @@ esp_err_t sd_card_scan_tracks(SemaphoreHandle_t spi_mutex) {
   int count = 0;
   struct dirent* entry;
   while ((entry = readdir(dir)) != NULL) {
-    if (entry->d_type == DT_DIR || !has_mp3_extension(entry->d_name)) {
+    // Skip hidden files too: macOS leaves "._name.mp3" AppleDouble stubs next
+    // to the real tracks on cards written from a Mac — they match ".mp3" but
+    // aren't playable audio.
+    if (entry->d_type == DT_DIR || entry->d_name[0] == '.' || !has_mp3_extension(entry->d_name)) {
       continue;
     }
     if (count >= SD_MAX_TRACKS) {
