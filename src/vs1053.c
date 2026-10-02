@@ -17,6 +17,12 @@ static const char* TAG = "VS1053";
 #define VS1053_PIN_DREQ 5  // input, data request
 #define VS1053_PIN_RESET 4
 
+// ---- VS1053 SPI bus (own bus, separate from the SD card's SPI2) ----
+#define VS1053_SPI_HOST SPI3_HOST
+#define VS1053_PIN_SCLK 38
+#define VS1053_PIN_MOSI 39  // VS1053 SI
+#define VS1053_PIN_MISO 40  // VS1053 SO
+
 // ---- SCI registers (standard VS1053 addresses) ----
 #define SCI_MODE 0x00
 #define SCI_STATUS 0x01
@@ -135,7 +141,7 @@ void vs1053_deselect_early(void) {
   ESP_LOGI(TAG, "XCS/XDCS deselected early (before SD card mount)");
 }
 
-esp_err_t vs1053_init(spi_host_device_t host, SemaphoreHandle_t spi_mutex) {
+esp_err_t vs1053_init(SemaphoreHandle_t spi_mutex) {
   if (spi_mutex == NULL) {
     ESP_LOGE(TAG, "vs1053_init: spi_mutex is NULL");
     return ESP_ERR_INVALID_ARG;
@@ -166,10 +172,21 @@ esp_err_t vs1053_init(spi_host_device_t host, SemaphoreHandle_t spi_mutex) {
   };
   ESP_ERROR_CHECK(gpio_config(&dreq_conf));
 
-  // --- SPI devices on an ALREADY EXISTING bus. host is passed in
-  //     externally — spi_bus_initialize() is NOT called here, it's
-  //     already done in main.c via esp_vfs_fat_sdspi_mount() for the
-  //     SD card. ---
+  // --- VS1053's own SPI bus (SPI3), independent from the SD card's SPI2 ---
+  spi_bus_config_t bus_cfg = {
+      .mosi_io_num = VS1053_PIN_MOSI,
+      .miso_io_num = VS1053_PIN_MISO,
+      .sclk_io_num = VS1053_PIN_SCLK,
+      .quadwp_io_num = -1,
+      .quadhd_io_num = -1,
+      .max_transfer_sz = 64,
+  };
+  esp_err_t ret = spi_bus_initialize(VS1053_SPI_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "spi_bus_initialize (SPI3) failed: %s", esp_err_to_name(ret));
+    return ret;
+  }
+
   spi_device_interface_config_t devcfg_low = {
       .clock_speed_hz = 800000,  // SCI, slow, safe before clock configuration
       .command_bits = 8,
@@ -185,7 +202,7 @@ esp_err_t vs1053_init(spi_host_device_t host, SemaphoreHandle_t spi_mutex) {
     return ESP_FAIL;
   }
 
-  esp_err_t ret = spi_bus_add_device(host, &devcfg_low, &s_spi_low_speed);
+  ret = spi_bus_add_device(VS1053_SPI_HOST, &devcfg_low, &s_spi_low_speed);
   if (ret != ESP_OK) {
     xSemaphoreGive(s_spi_mutex);
     ESP_LOGE(TAG, "spi_bus_add_device (low speed) failed: %s", esp_err_to_name(ret));
@@ -200,7 +217,7 @@ esp_err_t vs1053_init(spi_host_device_t host, SemaphoreHandle_t spi_mutex) {
   devcfg_high.command_bits = 0;
   devcfg_high.address_bits = 0;
 
-  ret = spi_bus_add_device(host, &devcfg_high, &s_spi_high_speed);
+  ret = spi_bus_add_device(VS1053_SPI_HOST, &devcfg_high, &s_spi_high_speed);
   if (ret != ESP_OK) {
     xSemaphoreGive(s_spi_mutex);
     ESP_LOGE(TAG, "spi_bus_add_device (high speed) failed: %s", esp_err_to_name(ret));

@@ -5,7 +5,9 @@
 
 #include "esp_log.h"
 #include "freertos/task.h"
+#include "player_state.h"
 #include "player_types.h"
+#include "sd_card.h"
 #include "vs1053.h"
 
 static const char* TAG = "audio_task";
@@ -23,11 +25,13 @@ static const char* TAG = "audio_task";
 //   now: set AUDIO_DEBUG_FILENAME to "demo_audio.mp3" or
 //   "demo_audio_2.mp3", rebuild — and the chosen file plays.
 //
-// AUDIO_DEBUG_MODE 0 — switches to get_current_track_path(), which
-//   is meant to take the path from the real track-selection logic
-//   (vSDTask + selection in SCREEN_LIST, architecture.md). This
-//   branch is currently a STUB — don't switch to 0 until the track
-//   list is implemented.
+//   NOTE: Next/Prev/Select still update player_state's track_index in
+//   this mode (and restart the stream), but the file played stays
+//   AUDIO_DEBUG_FILENAME — don't be misled by the logged track index.
+//
+// AUDIO_DEBUG_MODE 0 — get_current_track_path() takes the path of the
+//   track at player_state's track_index from the SD module's track
+//   list (selection happens on SCREEN_LIST, architecture.md).
 //
 // One macro — one switch point, the rest of audio_task's code stays
 // the same regardless of the mode.
@@ -35,16 +39,12 @@ static const char* TAG = "audio_task";
 #define AUDIO_DEBUG_MODE 1
 #define AUDIO_DEBUG_FILENAME "demo_audio.mp3"
 
-typedef enum { PLAYBACK_STOPPED = 0, PLAYBACK_PLAYING, PLAYBACK_PAUSED } playback_state_t;
-
 // -----------------------------------------------------------------
-// Module-private state (NOT extern, accessible only within this file)
+// Module-private state (NOT extern, accessible only within this file).
+// Playback state / volume / track index live in player_state.
 // -----------------------------------------------------------------
 static QueueHandle_t s_cmd_queue = NULL;
 static SemaphoreHandle_t s_spi_mutex = NULL;
-static char s_mount_point[32] = {0};
-static volatile playback_state_t s_state = PLAYBACK_STOPPED;
-static uint8_t s_volume = 70;  // 0..100, starting value
 
 // -----------------------------------------------------------------
 // Thin wrapper over the VS1053 driver. Called EXCLUSIVELY while
@@ -61,77 +61,91 @@ static esp_err_t send_to_codec(const uint8_t* data, size_t len) {
 // knows about AUDIO_DEBUG_MODE — audio_task itself doesn't see this
 // detail.
 // -----------------------------------------------------------------
-static void get_current_track_path(char* buf, size_t buf_size) {
+static esp_err_t get_current_track_path(char* buf, size_t buf_size) {
 #if AUDIO_DEBUG_MODE
-  snprintf(buf, buf_size, "%s/%s", s_mount_point, AUDIO_DEBUG_FILENAME);
+  snprintf(buf, buf_size, "%s/%s", sd_card_get_mount_point(), AUDIO_DEBUG_FILENAME);
+  return ESP_OK;
 #else
-  // TODO: real track selection from the list built by vSDTask
-  // (selection happens on SCREEN_LIST -> SCREEN_PLAYER,
-  // architecture.md). The stub below doesn't read any list —
-  // don't switch to AUDIO_DEBUG_MODE=0 until this branch is
-  // implemented.
-  snprintf(buf, buf_size, "%s/%s", s_mount_point, "song.mp3");
+  // Track chosen via player_state (set from SCREEN_LIST -> SCREEN_PLAYER,
+  // architecture.md), resolved to a path by the SD module's track list.
+  player_state_t state;
+  player_state_get(&state);
+  return sd_card_get_track_path(state.track_index, buf, buf_size);
 #endif
 }
 
-static void handle_cmd(const player_cmd_t* cmd) {
+// Returns true if the command changed the current track (the caller must
+// stop the current stream and start the track at player_state's index).
+static bool handle_cmd(const player_cmd_t* cmd) {
   switch (cmd->type) {
-    case CMD_PLAY_PAUSE:
-      if (s_state == PLAYBACK_PLAYING) {
-        s_state = PLAYBACK_PAUSED;
+    case CMD_PLAY_PAUSE: {
+      playback_state_t playback = player_state_get_playback();
+      if (playback == PLAYBACK_PLAYING) {
+        player_state_set_playback(PLAYBACK_PAUSED);
         ESP_LOGI(TAG, "Playback paused");
-      } else if (s_state == PLAYBACK_PAUSED) {
-        s_state = PLAYBACK_PLAYING;
+      } else if (playback == PLAYBACK_PAUSED) {
+        player_state_set_playback(PLAYBACK_PLAYING);
         ESP_LOGI(TAG, "Playback resumed");
       }
       break;
+    }
 
+    // No wrap-around: at the list boundaries player_state ignores the
+    // command (logs a warning) and the current track keeps playing.
     case CMD_NEXT:
+      return player_state_next_track();
+
     case CMD_PREV:
-      // TODO: track switching (out of scope for this example)
-      ESP_LOGW(TAG, "Track switching not implemented yet, command ignored");
-      break;
+      return player_state_prev_track();
+
+    case CMD_SELECT_TRACK:
+      // An explicit selection restarts the track even if it is the current one.
+      return player_state_select_track(cmd->index) == ESP_OK;
 
     case CMD_VOLUME_UP:
-      if (s_volume >= 100) {
-        ESP_LOGW(TAG, "Volume already at max (%d)", s_volume);
-        break;
+    case CMD_VOLUME_DOWN: {
+      uint8_t old_volume = player_state_get_volume();
+      uint8_t volume = player_state_change_volume(cmd->type == CMD_VOLUME_UP ? 10 : -10);
+      if (volume == old_volume) {
+        break;  // already at a limit (player_state logged the warning)
       }
-      s_volume = (s_volume <= 90) ? (uint8_t)(s_volume + 10) : 100;
-      vs1053_set_volume(s_volume);  // takes the mutex INTERNALLY, we do NOT hold it here
-      ESP_LOGI(TAG, "Volume up -> %d", s_volume);
+      // takes spi_mutex INTERNALLY, we do NOT hold it here (nor the state lock)
+      vs1053_set_volume(volume);
+      ESP_LOGI(TAG, "Volume %s -> %d", cmd->type == CMD_VOLUME_UP ? "up" : "down", volume);
       break;
-
-    case CMD_VOLUME_DOWN:
-      if (s_volume == 0) {
-        ESP_LOGW(TAG, "Volume already at min (%d)", s_volume);
-        break;
-      }
-      s_volume = (s_volume >= 10) ? (uint8_t)(s_volume - 10) : 0;
-      vs1053_set_volume(s_volume);
-      ESP_LOGI(TAG, "Volume down -> %d", s_volume);
-      break;
+    }
 
     default:
       ESP_LOGW(TAG, "Unknown command type %d, ignored", cmd->type);
       break;
   }
+  return false;
 }
 
-static void audio_task(void* arg) {
-  char path[64];
-  get_current_track_path(path, sizeof(path));
+typedef enum {
+  TRACK_FINISHED,  // end of file, codec error, or the track could not be opened
+  TRACK_CHANGED,   // a command selected another track — start it right away
+} track_result_t;
+
+// Streams the track at player_state's current index until it ends or a
+// command switches the track. Sets the state to PLAYING on entry (so a
+// track change also clears a pause); the caller sets STOPPED on
+// TRACK_FINISHED.
+static track_result_t stream_current_track(void) {
+  char path[SD_MAX_NAME + 16];
+  if (get_current_track_path(path, sizeof(path)) != ESP_OK) {
+    ESP_LOGE(TAG, "No track to play");
+    return TRACK_FINISHED;
+  }
 
   FILE* f = fopen(path, "rb");
   if (f == NULL) {
     ESP_LOGE(TAG, "Failed to open file %s", path);
-    s_state = PLAYBACK_STOPPED;
-    vTaskDelete(NULL);
-    return;
+    return TRACK_FINISHED;
   }
 
   ESP_LOGI(TAG, "Streaming %s", path);
-  s_state = PLAYBACK_PLAYING;
+  player_state_set_playback(PLAYBACK_PLAYING);
 
   // Reference VS1053 libraries (e.g. Adafruit, esp-idf-vs1053) send a
   // handful of zero "filler" bytes over SDI before the first real MP3
@@ -159,13 +173,17 @@ static void audio_task(void* arg) {
   int consecutive_codec_errors = 0;
   int chunks_sent = 0;
   int total_chunks_logged = 0;
+  track_result_t result = TRACK_FINISHED;
 #define DECODE_STATUS_LOG_EVERY_N_CHUNKS 200  // ~every 1.5s of audio at 128kbps
 
   while (1) {
     // --- While paused: block on the Queue with no timeout (0% CPU) ---
-    if (s_state == PLAYBACK_PAUSED) {
+    if (player_state_get_playback() == PLAYBACK_PAUSED) {
       if (xQueueReceive(s_cmd_queue, &cmd, portMAX_DELAY) == pdTRUE) {
-        handle_cmd(&cmd);
+        if (handle_cmd(&cmd)) {
+          result = TRACK_CHANGED;
+          break;
+        }
       }
       continue;  // re-check the state before reading the file
     }
@@ -173,8 +191,11 @@ static void audio_task(void* arg) {
     // --- In PLAYING mode: non-blocking queue check before each
     //     chunk, so a command (e.g. pause) doesn't wait for fread ---
     if (xQueueReceive(s_cmd_queue, &cmd, 0) == pdTRUE) {
-      handle_cmd(&cmd);
-      if (s_state != PLAYBACK_PLAYING) {
+      if (handle_cmd(&cmd)) {
+        result = TRACK_CHANGED;
+        break;
+      }
+      if (player_state_get_playback() != PLAYBACK_PLAYING) {
         continue;  // state changed (e.g. to PAUSED) — don't read a chunk
       }
     }
@@ -252,22 +273,45 @@ static void audio_task(void* arg) {
     }
   }
 
-  ESP_LOGI(TAG, "Done streaming file");
+  ESP_LOGI(TAG, "%s", result == TRACK_CHANGED ? "Track changed, closing file" : "Done streaming file");
   fclose(f);
-  s_state = PLAYBACK_STOPPED;
-  vTaskDelete(NULL);
+  return result;
 }
 
-esp_err_t audio_task_init(QueueHandle_t cmd_queue, SemaphoreHandle_t spi_mutex,
-                          const char* mount_point) {
-  if (cmd_queue == NULL || spi_mutex == NULL || mount_point == NULL) {
+static void audio_task(void* arg) {
+  player_cmd_t cmd;
+  bool start_track = true;  // autoplay the current track on startup
+
+  // The task never exits: after a track ends it waits for commands so
+  // Next/Prev/Select/Play can start another track.
+  while (1) {
+    if (start_track) {
+      if (stream_current_track() == TRACK_CHANGED) {
+        continue;  // start_track stays true: open the newly selected track
+      }
+      player_state_set_playback(PLAYBACK_STOPPED);
+      ESP_LOGI(TAG, "Playback stopped, waiting for commands");
+      start_track = false;
+      continue;
+    }
+
+    // --- STOPPED: block on the Queue with no timeout (0% CPU) ---
+    if (xQueueReceive(s_cmd_queue, &cmd, portMAX_DELAY) == pdTRUE) {
+      if (handle_cmd(&cmd) || cmd.type == CMD_PLAY_PAUSE) {
+        start_track = true;  // track changed, or Play pressed — (re)start current track
+      }
+    }
+  }
+}
+
+esp_err_t audio_task_init(QueueHandle_t cmd_queue, SemaphoreHandle_t spi_mutex) {
+  if (cmd_queue == NULL || spi_mutex == NULL) {
     ESP_LOGE(TAG, "audio_task_init: invalid arguments");
     return ESP_ERR_INVALID_ARG;
   }
 
   s_cmd_queue = cmd_queue;
   s_spi_mutex = spi_mutex;
-  strncpy(s_mount_point, mount_point, sizeof(s_mount_point) - 1);
 
 #if AUDIO_DEBUG_MODE
   ESP_LOGW(TAG, "AUDIO_DEBUG_MODE enabled: always playing %s, track list ignored",

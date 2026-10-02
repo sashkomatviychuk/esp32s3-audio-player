@@ -9,35 +9,32 @@
 
 /**
  * @brief Initializes the VS1053: configures GPIOs (XCS/XDCS/DREQ/RESET),
- *        adds two SPI devices (low-speed SCI, high-speed SDI) on an
- *        ALREADY EXISTING SPI bus (does not call spi_bus_initialize
- *        itself), runs the reset sequence, and applies base settings
- *        (SM_LINE1|SM_SDINEW, 44.1kHz stereo, clock multiplier).
+ *        initializes its OWN SPI bus (SPI3_HOST, separate from the SD
+ *        card's SPI2 bus), adds two SPI devices on it (low-speed SCI,
+ *        high-speed SDI), runs the reset sequence, and applies base
+ *        settings (SM_LINE1|SM_SDINEW, 44.1kHz stereo, clock multiplier).
  *
- * @param host      SPI host on which spi_bus_initialize() has already
- *                  been called (the same host/bus as the SD card —
- *                  with separate CS pins)
- * @param spi_mutex Mutex protecting the shared SPI bus (VS1053 + SD card).
- *                  Taken INTERNALLY during init and in vs1053_set_volume().
- *                  NOT taken inside vs1053_write_sdi() — that function must
- *                  be called while the caller (audio_task) already holds
- *                  spi_mutex itself (to avoid double-locking a
- *                  non-recursive mutex).
+ * @param spi_mutex Mutex serializing SD card and VS1053 access from
+ *                  audio_task. Taken INTERNALLY during init and in
+ *                  vs1053_set_volume(). NOT taken inside
+ *                  vs1053_write_sdi() — that function must be called while
+ *                  the caller (audio_task) already holds spi_mutex itself
+ *                  (to avoid double-locking a non-recursive mutex).
  *
  * @return ESP_OK on success, ESP_ERR_INVALID_ARG if spi_mutex == NULL,
- *         another esp_err_t error if adding the SPI device failed
+ *         another esp_err_t error if the SPI bus init or adding the SPI
+ *         device failed
  */
-esp_err_t vs1053_init(spi_host_device_t host, SemaphoreHandle_t spi_mutex);
+esp_err_t vs1053_init(SemaphoreHandle_t spi_mutex);
 
 /**
  * @brief Configures the VS1053 XCS/XDCS pins as outputs and drives them
  *        HIGH (deselected) immediately, WITHOUT touching the SPI bus.
  *
- * Call this BEFORE spi_bus_initialize()/mounting the SD card, which
- * shares the same MISO/MOSI/SCLK lines. Without it, XCS/XDCS stay
- * floating (default GPIO input state) until vs1053_init() runs, so the
- * VS1053 can spuriously think it is selected and corrupt SD card SPI
- * traffic (e.g. garbled CSD reads) before vs1053_init() is ever called.
+ * The VS1053 now has its own SPI bus (no longer shared with the SD card),
+ * so a floating XCS/XDCS can no longer corrupt SD traffic. Still worth
+ * calling early: it keeps the chip deselected (no spurious SCI/SDI
+ * activity) until vs1053_init() runs.
  *
  * vs1053_init() re-configures and re-asserts these same pins as part of
  * its own setup, so calling this first is safe and does not need to be
@@ -51,8 +48,7 @@ void vs1053_deselect_early(void);
  *
  * IMPORTANT: this function does NOT take spi_mutex itself — the caller
  * (send_to_codec() in audio_task.c) must hold spi_mutex at the time of
- * the call. Calling it without holding the mutex is a race on the
- * shared SPI bus (the same bus used by the SD card).
+ * the call, so SD and VS1053 accesses from different tasks stay serialized.
  *
  * @param data  Buffer with MP3 data
  * @param bytes Number of bytes, must be <= 32
