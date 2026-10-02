@@ -15,6 +15,7 @@ typedef struct {
   int track_count;  // number of tracks found on the SD card
   uint32_t elapsed_sec;   // playback position of the current track
   uint32_t duration_sec;  // estimated track length, 0 if unknown
+  bool sd_present;        // SD card mounted and its track list scanned
 } player_state_t;
 
 /**
@@ -88,6 +89,13 @@ bool player_state_prev_track(void);
 
 /** @brief Sets the number of available tracks. Locking: internal state mutex only. */
 void player_state_set_track_count(int count);
+
+/**
+ * @brief Publishes whether an SD card is mounted (drives the display view).
+ *
+ * Locking: internal state mutex only.
+ */
+void player_state_set_sd_present(bool present);
 
 /**
  * @brief Publishes the playback position and the (estimated) track length.

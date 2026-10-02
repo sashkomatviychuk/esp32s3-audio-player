@@ -43,6 +43,20 @@ static const uint8_t ICON_PLAY[8] = {0x80, 0xC0, 0xE0, 0xF0, 0xF0, 0xE0, 0xC0, 0
 static const uint8_t ICON_PAUSE[8] = {0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66};
 static const uint8_t ICON_STOP[8] = {0x00, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x00};
 
+// 16x16 warning triangle with "!", same format (2 bytes per row)
+static const uint8_t ICON_WARNING[32] = {0x01, 0x80, 0x02, 0x40, 0x02, 0x40, 0x05, 0xA0,
+                                         0x09, 0x90, 0x09, 0x90, 0x11, 0x88, 0x11, 0x88,
+                                         0x21, 0x84, 0x21, 0x84, 0x40, 0x02, 0x41, 0x82,
+                                         0x81, 0x81, 0x80, 0x01, 0xFF, 0xFF, 0x00, 0x00};
+
+// ---- NO_SD view layout ----
+#define NO_SD_ICON_SIZE 16
+#define NO_SD_ICON_X ((128 - NO_SD_ICON_SIZE) / 2)
+#define NO_SD_ICON_Y 10
+#define NO_SD_LINE1 "Please insert"
+#define NO_SD_LINE2 "SD card"
+#define NO_SD_TEXT_Y 34
+
 // -----------------------------------------------------------------
 // Drawing primitives (framebuffer only)
 // -----------------------------------------------------------------
@@ -241,4 +255,43 @@ void display_render_list(const player_state_t* state) {
     format_track_name(name != NULL ? name : "?", label, sizeof(label));
     draw_text(LIST_TEXT_X, y + 1, label, LIST_MAX_CHARS);
   }
+}
+
+// -----------------------------------------------------------------
+// Views (full-screen layouts)
+// -----------------------------------------------------------------
+static void view_player(const player_state_t* state) {
+  display_render_header(state);
+  display_render_list(state);
+}
+
+// Draws text horizontally centered (8 px per glyph).
+static void draw_text_centered(int y, const char* text) {
+  int len = (int)strlen(text);
+  draw_text((128 - (len * GLYPH_SIZE)) / 2, y, text, len);
+}
+
+static void view_no_sd(const player_state_t* state) {
+  (void)state;
+  ssd1306_set_bitmap(s_display, NO_SD_ICON_X, NO_SD_ICON_Y, ICON_WARNING, NO_SD_ICON_SIZE,
+                     NO_SD_ICON_SIZE, false);
+  draw_text_centered(NO_SD_TEXT_Y, NO_SD_LINE1);
+  draw_text_centered(NO_SD_TEXT_Y + GLYPH_SIZE + 2, NO_SD_LINE2);
+}
+
+// Indexed by display_view_t.
+static void (*const s_views[DISPLAY_VIEW_COUNT])(const player_state_t*) = {
+    [DISPLAY_VIEW_PLAYER] = view_player,
+    [DISPLAY_VIEW_NO_SD] = view_no_sd,
+};
+
+void display_render_view(display_view_t view, const player_state_t* state) {
+  if (s_display == NULL) {
+    return;
+  }
+  if ((int)view < 0 || view >= DISPLAY_VIEW_COUNT || s_views[view] == NULL) {
+    ESP_LOGW(TAG, "Unknown view %d", (int)view);
+    return;
+  }
+  s_views[view](state);
 }

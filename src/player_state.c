@@ -136,8 +136,21 @@ bool player_state_prev_track(void) {
 void player_state_set_track_count(int count) {
   xSemaphoreTake(s_state_mutex, portMAX_DELAY);
   s_state.track_count = count;
+  if (s_state.track_index >= count) {
+    // Card was swapped / removed: the old index no longer points at a track
+    s_state.track_index = 0;
+    s_state.elapsed_sec = 0;
+    s_state.duration_sec = 0;
+  }
   xSemaphoreGive(s_state_mutex);
   ESP_LOGI(TAG, "Track count -> %d", count);
+}
+
+void player_state_set_sd_present(bool present) {
+  xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+  s_state.sd_present = present;
+  xSemaphoreGive(s_state_mutex);
+  ESP_LOGI(TAG, "SD present -> %d", present);
 }
 
 void player_state_set_progress(uint32_t elapsedSec, uint32_t durationSec) {

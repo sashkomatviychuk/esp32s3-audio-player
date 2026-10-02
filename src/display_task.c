@@ -14,29 +14,39 @@ static const char* TAG = "display_task";
 #define DISPLAY_PERIOD_MS 250
 
 static bool state_changed(const player_state_t* a, const player_state_t* b) {
-  return a->playback != b->playback || a->volume != b->volume ||
-         a->track_index != b->track_index || a->track_count != b->track_count ||
-         a->elapsed_sec != b->elapsed_sec || a->duration_sec != b->duration_sec;
+  return a->playback != b->playback || a->volume != b->volume || a->track_index != b->track_index ||
+         a->track_count != b->track_count || a->elapsed_sec != b->elapsed_sec ||
+         a->duration_sec != b->duration_sec || a->sd_present != b->sd_present;
+}
+
+// The single place with routing rules: which view the current state calls for.
+static display_view_t select_view(const player_state_t* state) {
+  if (!state->sd_present) {
+    return DISPLAY_VIEW_NO_SD;
+  }
+  return DISPLAY_VIEW_PLAYER;
 }
 
 static void display_task(void* arg) {
   player_state_t last = {0};
+  display_view_t lastView = DISPLAY_VIEW_PLAYER;
   bool firstFrame = true;
   TickType_t lastWake = xTaskGetTickCount();
 
   while (1) {
     player_state_t now;
     player_state_get(&now);
+    display_view_t view = select_view(&now);
 
-    if (firstFrame || state_changed(&now, &last)) {
+    if (firstFrame || view != lastView || state_changed(&now, &last)) {
       display_clear();
-      display_render_header(&now);
-      display_render_list(&now);
+      display_render_view(view, &now);
       esp_err_t ret = display_flush();
       if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Display flush failed: %s", esp_err_to_name(ret));
       } else {
         last = now;
+        lastView = view;
         firstFrame = false;
       }
     }

@@ -42,9 +42,10 @@ void app_main(void) {
 
   // Initializes the SD card's SPI bus (SPI2) and mounts the card.
   spi_host_device_t spi_host;
+  // A missing card is not fatal: sd_card_monitor_init() keeps retrying and
+  // the display shows a "please insert SD card" view meanwhile.
   if (sd_card_init(&spi_host) != ESP_OK) {
-    ESP_LOGE(TAG, "sd_card_init failed");
-    return;
+    ESP_LOGW(TAG, "sd_card_init failed (no card?), will keep retrying");
   }
 
   // VS1053 initializes its own, separate SPI bus (SPI3) inside vs1053_init.
@@ -53,8 +54,9 @@ void app_main(void) {
     return;
   }
 
-  if (sd_card_scan_tracks(spi_mutex) != ESP_OK) {
-    ESP_LOGE(TAG, "sd_card_scan_tracks failed");
+  // Scans the card now (if present) and then watches for insert / removal.
+  if (sd_card_monitor_init(spi_mutex) != ESP_OK) {
+    ESP_LOGE(TAG, "sd_card_monitor_init failed");
     return;
   }
 

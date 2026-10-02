@@ -9,6 +9,7 @@
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
 #include "player_state.h"
+#include "freertos/task.h"
 #include "sdmmc_cmd.h"
 
 static const char* TAG = "sd_card";
@@ -25,11 +26,48 @@ static const char* TAG = "sd_card";
 // -----------------------------------------------------------------
 static char s_tracks[SD_MAX_TRACKS][SD_MAX_NAME];
 static int s_track_count = 0;
+static sdmmc_card_t* s_card = NULL;  // non-NULL while the card is mounted
+static bool s_bus_ready = false;     // SPI2 bus is initialized once, never freed
+static bool s_published = false;     // tracks scanned and sd_present published for this mount
 
-esp_err_t sd_card_init(spi_host_device_t* out_host) {
-  if (out_host == NULL) {
-    ESP_LOGE(TAG, "sd_card_init: invalid arguments");
-    return ESP_ERR_INVALID_ARG;
+#define MONITOR_TASK_STACK_SIZE 4096
+#define MONITOR_TASK_PRIORITY 1  // lowest: only retries mounts / probes the card
+#define MONITOR_PERIOD_MS 2000
+
+static esp_err_t init_bus(void) {
+  if (s_bus_ready) {
+    return ESP_OK;
+  }
+
+  spi_bus_config_t bus_cfg = {
+      .mosi_io_num = PIN_NUM_MOSI,
+      .miso_io_num = PIN_NUM_MISO,
+      .sclk_io_num = PIN_NUM_CLK,
+      .quadwp_io_num = -1,
+      .quadhd_io_num = -1,
+      .max_transfer_sz = 4000,
+  };
+
+  // SPI2 bus for the SD card only. VS1053 initializes its own SPI3 bus in
+  // vs1053_init(). The bus stays up when the card is removed, so re-mounting
+  // does not have to initialize it again.
+  esp_err_t ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SDSPI_DEFAULT_DMA);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to init SPI bus: %s", esp_err_to_name(ret));
+    return ret;
+  }
+  s_bus_ready = true;
+  return ESP_OK;
+}
+
+esp_err_t sd_card_try_mount(void) {
+  if (s_card != NULL) {
+    return ESP_OK;
+  }
+
+  esp_err_t ret = init_bus();
+  if (ret != ESP_OK) {
+    return ret;
   }
 
   // format_if_mount_failed is OFF: f_mkfs's multi-block write (CMD25 +
@@ -56,23 +94,6 @@ esp_err_t sd_card_init(spi_host_device_t* out_host) {
   // instead of a CRC error. With CRC enabled, the card reads/writes
   // correctly and mounts fine — the data was never actually corrupted.
 
-  spi_bus_config_t bus_cfg = {
-      .mosi_io_num = PIN_NUM_MOSI,
-      .miso_io_num = PIN_NUM_MISO,
-      .sclk_io_num = PIN_NUM_CLK,
-      .quadwp_io_num = -1,
-      .quadhd_io_num = -1,
-      .max_transfer_sz = 4000,
-  };
-
-  // SPI2 bus for the SD card only. VS1053 initializes its own SPI3 bus in
-  // vs1053_init().
-  esp_err_t ret = spi_bus_initialize(host.slot, &bus_cfg, SDSPI_DEFAULT_DMA);
-  if (ret != ESP_OK) {
-    ESP_LOGE(TAG, "Failed to init SPI bus: %s", esp_err_to_name(ret));
-    return ret;
-  }
-
   sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
   slot_config.gpio_cs = PIN_NUM_CS;
   slot_config.host_id = host.slot;
@@ -87,15 +108,32 @@ esp_err_t sd_card_init(spi_host_device_t* out_host) {
   sdmmc_card_t* card = NULL;
   ret = esp_vfs_fat_sdspi_mount(MOUNT_POINT, &host, &slot_config, &mount_config, &card);
   if (ret != ESP_OK) {
-    ESP_LOGE(TAG, "esp_vfs_fat_sdspi_mount failed: %s", esp_err_to_name(ret));
+    ESP_LOGW(TAG, "esp_vfs_fat_sdspi_mount failed: %s", esp_err_to_name(ret));
     return ret;
   }
 
+  s_card = card;
   ESP_LOGI(TAG, "SD card mounted at %s", MOUNT_POINT);
   sdmmc_card_print_info(stdout, card);
-
-  *out_host = (spi_host_device_t)host.slot;
   return ESP_OK;
+}
+
+bool sd_card_is_mounted(void) {
+  return s_card != NULL;
+}
+
+esp_err_t sd_card_init(spi_host_device_t* out_host) {
+  if (out_host == NULL) {
+    ESP_LOGE(TAG, "sd_card_init: invalid arguments");
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  esp_err_t ret = init_bus();
+  if (ret != ESP_OK) {
+    return ret;
+  }
+  *out_host = SPI2_HOST;
+  return sd_card_try_mount();
 }
 
 const char* sd_card_get_mount_point(void) {
@@ -184,6 +222,73 @@ esp_err_t sd_card_get_track_path(int index, char* buf, size_t buf_size) {
   if (written < 0 || (size_t)written >= buf_size) {
     ESP_LOGE(TAG, "Path buffer too small for track %d", index);
     return ESP_ERR_INVALID_SIZE;
+  }
+  return ESP_OK;
+}
+
+// -----------------------------------------------------------------
+// Hot-plug monitor
+// -----------------------------------------------------------------
+static void unmount_card(void) {
+  esp_vfs_fat_sdcard_unmount(MOUNT_POINT, s_card);
+  s_card = NULL;
+  s_published = false;
+  s_track_count = 0;
+  player_state_set_track_count(0);
+  player_state_set_sd_present(false);
+}
+
+// One pass: mount (if needed) + scan + publish until the card is "published",
+// then probe that it still answers. The card may already be mounted by
+// sd_card_init() on the first pass.
+static void monitor_step(SemaphoreHandle_t spi_mutex) {
+  if (!s_published) {
+    if (sd_card_try_mount() != ESP_OK) {
+      return;
+    }
+    if (sd_card_scan_tracks(spi_mutex) != ESP_OK) {
+      ESP_LOGW(TAG, "Track scan failed, unmounting");
+      unmount_card();
+      return;
+    }
+    s_published = true;
+    player_state_set_sd_present(true);
+    return;
+  }
+
+  if (xSemaphoreTake(spi_mutex, portMAX_DELAY) != pdTRUE) {
+    return;
+  }
+  esp_err_t ret = sdmmc_get_status(s_card);
+  if (ret != ESP_OK) {
+    ESP_LOGW(TAG, "SD card stopped responding (%s), unmounting", esp_err_to_name(ret));
+    unmount_card();
+  }
+  xSemaphoreGive(spi_mutex);
+}
+
+static void monitor_task(void* arg) {
+  SemaphoreHandle_t spi_mutex = (SemaphoreHandle_t)arg;
+  while (1) {
+    vTaskDelay(pdMS_TO_TICKS(MONITOR_PERIOD_MS));
+    monitor_step(spi_mutex);
+  }
+}
+
+esp_err_t sd_card_monitor_init(SemaphoreHandle_t spi_mutex) {
+  if (spi_mutex == NULL) {
+    ESP_LOGE(TAG, "sd_card_monitor_init: invalid arguments");
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  // First pass synchronously so the track list is ready before audio_task
+  monitor_step(spi_mutex);
+
+  BaseType_t created = xTaskCreate(monitor_task, "sd_monitor", MONITOR_TASK_STACK_SIZE,
+                                   spi_mutex, MONITOR_TASK_PRIORITY, NULL);
+  if (created != pdPASS) {
+    ESP_LOGE(TAG, "Failed to create sd_monitor task");
+    return ESP_FAIL;
   }
   return ESP_OK;
 }

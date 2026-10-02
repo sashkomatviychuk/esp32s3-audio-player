@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 
 #include "driver/spi_common.h"
@@ -20,9 +21,39 @@
  *
  * @param[out] out_host SPI host the SD bus was initialized on
  *
- * @return ESP_OK on success, an error if the bus init, card init or mount failed
+ * @return ESP_OK on success, an error if the bus init, card init or mount failed.
+ *         A mount failure (no card) is not fatal: sd_card_monitor_init()
+ *         keeps retrying it.
  */
 esp_err_t sd_card_init(spi_host_device_t* out_host);
+
+/**
+ * @brief Tries to mount the card (initializing the SPI bus on first use).
+ *        Does nothing if already mounted. A failure is expected when no card
+ *        is inserted and is only logged as a warning.
+ *
+ * Locking: takes no mutex — call it before audio_task is created or from
+ * the monitor task while no one else uses the card.
+ *
+ * @return ESP_OK if mounted, otherwise the mount/bus error
+ */
+esp_err_t sd_card_try_mount(void);
+
+/** @brief Returns true while the card is mounted. */
+bool sd_card_is_mounted(void);
+
+/**
+ * @brief Runs one mount + scan pass immediately, then starts a low-priority
+ *        task that every ~2 s re-mounts a missing card (and scans it) or
+ *        unmounts a card that stopped answering. Keeps
+ *        player_state_set_sd_present() and the track count up to date.
+ *
+ * Locking: takes @p spi_mutex internally — call WITHOUT holding it.
+ *
+ * @return ESP_OK, ESP_ERR_INVALID_ARG if @p spi_mutex is NULL, ESP_FAIL if the
+ *         task could not be created
+ */
+esp_err_t sd_card_monitor_init(SemaphoreHandle_t spi_mutex);
 
 /** @brief Returns the SD mount point (e.g. "/sdcard"). */
 const char* sd_card_get_mount_point(void);
