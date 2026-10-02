@@ -20,7 +20,13 @@ static const char* TAG = "display";
 #define DISPLAY_I2C_SPEED_HZ 400000  // a 1KB framebuffer flush is too slow at 100kHz
 
 // ---- Layout (128x64) ----
+#define DISPLAY_WIDTH 128
 #define GLYPH_SIZE 8
+#define ICON_SIZE 8
+#define FONT_LAST_CHAR 0x7E  // the font covers ASCII up to '~'
+#define MAX_TIME_SEC (99 * 60 + 59)  // "99:59" is the widest time that fits the header
+#define HEADER_TIME_CHARS 11         // "MM:SS/MM:SS"
+#define TIME_BUF_SIZE 16
 #define HEADER_Y 0
 #define HEADER_TIME_X 0
 #define HEADER_ICON_X 92
@@ -51,11 +57,12 @@ static const uint8_t ICON_WARNING[32] = {0x01, 0x80, 0x02, 0x40, 0x02, 0x40, 0x0
 
 // ---- NO_SD view layout ----
 #define NO_SD_ICON_SIZE 16
-#define NO_SD_ICON_X ((128 - NO_SD_ICON_SIZE) / 2)
+#define NO_SD_ICON_X ((DISPLAY_WIDTH - NO_SD_ICON_SIZE) / 2)
 #define NO_SD_ICON_Y 10
 #define NO_SD_LINE1 "Please insert"
 #define NO_SD_LINE2 "SD card"
 #define NO_SD_TEXT_Y 34
+#define NO_SD_LINE_GAP 2
 
 // -----------------------------------------------------------------
 // Drawing primitives (framebuffer only)
@@ -63,7 +70,7 @@ static const uint8_t ICON_WARNING[32] = {0x01, 0x80, 0x02, 0x40, 0x02, 0x40, 0x0
 static void draw_text(int x, int y, const char* text, int maxChars) {
   for (int i = 0; i < maxChars && text[i] != '\0'; i++) {
     unsigned char ch = (unsigned char)text[i];
-    if (ch > 0x7E) {
+    if (ch > FONT_LAST_CHAR) {
       ch = '?';  // the font is Latin-only: show a placeholder for UTF-8 bytes
     }
     // font_latin_8x8_tr is column-major: byte = column, bit 0 = top row
@@ -77,6 +84,12 @@ static void draw_text(int x, int y, const char* text, int maxChars) {
       }
     }
   }
+}
+
+// Draws text horizontally centered (8 px per glyph).
+static void draw_text_centered(int y, const char* text) {
+  int len = (int)strlen(text);
+  draw_text((DISPLAY_WIDTH - (len * GLYPH_SIZE)) / 2, y, text, len);
 }
 
 static void draw_rounded_frame(int x, int y, int w, int h) {
@@ -129,12 +142,12 @@ static void format_track_name(const char* name, char* out, size_t outSize) {
 }
 
 static void format_time(char* out, size_t outSize, const player_state_t* state) {
-  unsigned elapsed = state->elapsed_sec > 99 * 60 + 59 ? 99 * 60 + 59 : state->elapsed_sec;
+  unsigned elapsed = state->elapsed_sec > MAX_TIME_SEC ? MAX_TIME_SEC : state->elapsed_sec;
   if (state->duration_sec == 0) {
     snprintf(out, outSize, "%02u:%02u/--:--", elapsed / 60, elapsed % 60);
     return;
   }
-  unsigned total = state->duration_sec > 99 * 60 + 59 ? 99 * 60 + 59 : state->duration_sec;
+  unsigned total = state->duration_sec > MAX_TIME_SEC ? MAX_TIME_SEC : state->duration_sec;
   snprintf(out, outSize, "%02u:%02u/%02u:%02u", elapsed / 60, elapsed % 60, total / 60, total % 60);
 }
 
@@ -199,9 +212,9 @@ void display_render_header(const player_state_t* state) {
     return;
   }
 
-  char time[16];
+  char time[TIME_BUF_SIZE];
   format_time(time, sizeof(time), state);
-  draw_text(HEADER_TIME_X, HEADER_Y, time, 11);
+  draw_text(HEADER_TIME_X, HEADER_Y, time, HEADER_TIME_CHARS);
 
   const uint8_t* icon = ICON_STOP;
   if (state->playback == PLAYBACK_PLAYING) {
@@ -209,14 +222,14 @@ void display_render_header(const player_state_t* state) {
   } else if (state->playback == PLAYBACK_PAUSED) {
     icon = ICON_PAUSE;
   }
-  ssd1306_set_bitmap(s_display, HEADER_ICON_X, HEADER_Y, icon, 8, 8, false);
+  ssd1306_set_bitmap(s_display, HEADER_ICON_X, HEADER_Y, icon, ICON_SIZE, ICON_SIZE, false);
 
 #if AUDIO_DEBUG_MODE
   draw_text(HEADER_DEBUG_X, HEADER_Y, "D", 1);
 #endif
 
   draw_bar(HEADER_BAR_X, HEADER_Y, HEADER_BAR_W, HEADER_BAR_H, state->volume);
-  ssd1306_set_line(s_display, 0, SEPARATOR_Y, 127, SEPARATOR_Y, false);
+  ssd1306_set_line(s_display, 0, SEPARATOR_Y, DISPLAY_WIDTH - 1, SEPARATOR_Y, false);
 }
 
 void display_render_list(const player_state_t* state) {
@@ -225,7 +238,7 @@ void display_render_list(const player_state_t* state) {
   }
 
   if (state->track_count <= 0) {
-    draw_text(24, LIST_Y + 2 * LIST_ROW_H, "No tracks", 9);
+    draw_text_centered(LIST_Y + (LIST_ROWS / 2) * LIST_ROW_H, "No tracks");
     return;
   }
 
@@ -249,7 +262,7 @@ void display_render_list(const player_state_t* state) {
 #if AUDIO_DEBUG_MODE
       name = AUDIO_DEBUG_FILENAME;  // show what is really playing
 #endif
-      draw_rounded_frame(0, y, 128, LIST_ROW_H);
+      draw_rounded_frame(0, y, DISPLAY_WIDTH, LIST_ROW_H);
     }
     char label[LIST_MAX_CHARS + 1];
     format_track_name(name != NULL ? name : "?", label, sizeof(label));
@@ -265,18 +278,12 @@ static void view_player(const player_state_t* state) {
   display_render_list(state);
 }
 
-// Draws text horizontally centered (8 px per glyph).
-static void draw_text_centered(int y, const char* text) {
-  int len = (int)strlen(text);
-  draw_text((128 - (len * GLYPH_SIZE)) / 2, y, text, len);
-}
-
 static void view_no_sd(const player_state_t* state) {
   (void)state;
   ssd1306_set_bitmap(s_display, NO_SD_ICON_X, NO_SD_ICON_Y, ICON_WARNING, NO_SD_ICON_SIZE,
                      NO_SD_ICON_SIZE, false);
   draw_text_centered(NO_SD_TEXT_Y, NO_SD_LINE1);
-  draw_text_centered(NO_SD_TEXT_Y + GLYPH_SIZE + 2, NO_SD_LINE2);
+  draw_text_centered(NO_SD_TEXT_Y + GLYPH_SIZE + NO_SD_LINE_GAP, NO_SD_LINE2);
 }
 
 // Indexed by display_view_t.

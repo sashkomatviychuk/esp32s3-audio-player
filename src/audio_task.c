@@ -21,6 +21,20 @@ static const char* TAG = "audio_task";
 #define AUDIO_TASK_PRIORITY 5
 #define PROGRESS_UPDATE_PERIOD_US 500000  // how often elapsed time is published
 #define MAX_CONSECUTIVE_CODEC_ERRORS 10   // stop playback if VS1053 stays unresponsive
+#define VOLUME_STEP 10                    // percent per CMD_VOLUME_UP / CMD_VOLUME_DOWN
+#define CODEC_FILLER_BYTES 10             // zero bytes sent before the first MP3 data
+#define PATH_EXTRA_CHARS 16               // room for "<mount point>/" around a track name
+#define BITS_PER_BYTE 8
+#define DEBUG_DUMP_CHUNKS 5               // first chunks hex-dumped after reading from the SD
+#define YIELD_EVERY_N_CHUNKS 32           // taskYIELD() cadence, keeps the watchdog fed
+#define DECODE_STATUS_LOG_EVERY_N_CHUNKS 200  // ~every 1.5s of audio at 128kbps
+
+// 2048 reintroduced the SD CRC failures sd-card-issues.md already fixed
+// once (sdspi_host: data CRC failed, mid-stream): a longer continuous SPI
+// transaction on this breadboard wiring/100kHz is more likely to glitch.
+// 512 matches the FAT/SD sector size — still batches the mutex/queue-check
+// overhead that came with per-32-byte reads, without the long transaction.
+#define READ_BUF_SIZE 512  // read in large blocks, feed VS1053 in 32-byte SDI chunks from it
 
 // AUDIO_DEBUG_MODE / AUDIO_DEBUG_FILENAME are defined in audio_task.h
 
@@ -90,7 +104,7 @@ static bool handle_cmd(const player_cmd_t* cmd) {
     case CMD_VOLUME_UP:
     case CMD_VOLUME_DOWN: {
       uint8_t old_volume = player_state_get_volume();
-      uint8_t volume = player_state_change_volume(cmd->type == CMD_VOLUME_UP ? 10 : -10);
+      uint8_t volume = player_state_change_volume(cmd->type == CMD_VOLUME_UP ? VOLUME_STEP : -VOLUME_STEP);
       if (volume == old_volume) {
         break;  // already at a limit (player_state logged the warning)
       }
@@ -107,6 +121,19 @@ static bool handle_cmd(const player_cmd_t* cmd) {
   return false;
 }
 
+// Reference VS1053 libraries (e.g. Adafruit, esp-idf-vs1053) send a
+// handful of zero "filler" bytes over SDI before the first real MP3
+// data, to prime the decoder. Our stream never sends these — try it,
+// since HDAT0/HDAT1 never showing decoded-frame info otherwise matches
+// the symptom this is meant to fix.
+static void send_codec_filler(void) {
+  uint8_t filler[CODEC_FILLER_BYTES] = {0};
+  if (xSemaphoreTake(s_spi_mutex, portMAX_DELAY) == pdTRUE) {
+    send_to_codec(filler, sizeof(filler));
+    xSemaphoreGive(s_spi_mutex);
+  }
+}
+
 typedef enum {
   TRACK_FINISHED,  // end of file, codec error, or the track could not be opened
   TRACK_CHANGED,   // a command selected another track — start it right away
@@ -117,7 +144,7 @@ typedef enum {
 // track change also clears a pause); the caller sets STOPPED on
 // TRACK_FINISHED.
 static track_result_t stream_current_track(void) {
-  char path[SD_MAX_NAME + 16];
+  char path[SD_MAX_NAME + PATH_EXTRA_CHARS];
   if (get_current_track_path(path, sizeof(path)) != ESP_OK) {
     ESP_LOGE(TAG, "No track to play");
     return TRACK_FINISHED;
@@ -149,25 +176,8 @@ static track_result_t stream_current_track(void) {
 
   player_state_set_playback(PLAYBACK_PLAYING);
 
-  // Reference VS1053 libraries (e.g. Adafruit, esp-idf-vs1053) send a
-  // handful of zero "filler" bytes over SDI before the first real MP3
-  // data, to prime the decoder. Our stream never sends these — try it,
-  // since HDAT0/HDAT1 never showing decoded-frame info otherwise matches
-  // the symptom this is meant to fix.
-  {
-    uint8_t filler[10] = {0};
-    if (xSemaphoreTake(s_spi_mutex, portMAX_DELAY) == pdTRUE) {
-      send_to_codec(filler, sizeof(filler));
-      xSemaphoreGive(s_spi_mutex);
-    }
-  }
+  send_codec_filler();
 
-// 2048 reintroduced the SD CRC failures sd-card-issues.md already fixed
-// once (sdspi_host: data CRC failed, mid-stream): a longer continuous SPI
-// transaction on this breadboard wiring/100kHz is more likely to glitch.
-// 512 matches the FAT/SD sector size — still batches the mutex/queue-check
-// overhead that came with per-32-byte reads, without the long transaction.
-#define READ_BUF_SIZE 512  // read in large blocks, feed VS1053 in 32-byte SDI chunks from it
   static uint8_t read_buf[READ_BUF_SIZE];
   size_t read_buf_len = 0;
   size_t read_buf_pos = 0;
@@ -179,7 +189,6 @@ static track_result_t stream_current_track(void) {
   bool reachedEof = false;
   bool read_error = false;  // the loop ended on an SD read error, not a real EOF
   int read_errno = 0;
-#define DECODE_STATUS_LOG_EVERY_N_CHUNKS 200  // ~every 1.5s of audio at 128kbps
 
   while (1) {
     // --- While paused: block on the Queue with no timeout (0% CPU) ---
@@ -241,7 +250,7 @@ static track_result_t stream_current_track(void) {
     //     to confirm fread is actually returning real file bytes (MP3
     //     sync word 0xFF 0xFB expected at the very start) before they
     //     get sent to the codec ---
-    if (total_chunks_logged < 5) {
+    if (total_chunks_logged < DEBUG_DUMP_CHUNKS) {
       char hex[(CHUNK_SIZE * 3) + 1];
       for (size_t i = 0; i < bytes_to_send; i++) {
         snprintf(hex + (i * 3), 4, "%02X ", chunk[i]);
@@ -255,7 +264,7 @@ static track_result_t stream_current_track(void) {
         esp_timer_get_time() - lastProgressUs >= PROGRESS_UPDATE_PERIOD_US) {
       lastProgressUs = esp_timer_get_time();
       uint64_t audioBytes = bytesSent > info.audio_start ? bytesSent - info.audio_start : 0;
-      player_state_set_progress((uint32_t)(audioBytes * 8 / info.bitrate_bps), info.duration_sec);
+      player_state_set_progress((uint32_t)(audioBytes * BITS_PER_BYTE / info.bitrate_bps), info.duration_sec);
     }
 
     // --- Send to VS1053, under the mutex for the same SPI bus ---
@@ -292,7 +301,7 @@ static track_result_t stream_current_track(void) {
     // (checked inside vs1053_write_sdi) is what actually paces us against
     // the codec; this is only here often enough to keep the watchdog fed
     // and let other tasks run.
-    if ((chunks_sent % 32) == 0) {
+    if ((chunks_sent % YIELD_EVERY_N_CHUNKS) == 0) {
       taskYIELD();
     }
   }
@@ -301,12 +310,12 @@ static track_result_t stream_current_track(void) {
     ESP_LOGE(TAG, "SD read error (errno %d), stopping playback", read_errno);
   } else {
     // The periodic update can lag up to PROGRESS_UPDATE_PERIOD_US and the byte
-  // count is rounded down, so snap to the full length once the file is done.
-  if (reachedEof && info.duration_sec > 0) {
-    player_state_set_progress(info.duration_sec, info.duration_sec);
-  }
+    // count is rounded down, so snap to the full length once the file is done.
+    if (reachedEof && info.duration_sec > 0) {
+      player_state_set_progress(info.duration_sec, info.duration_sec);
+    }
 
-  ESP_LOGI(TAG, "%s", result == TRACK_CHANGED ? "Track changed, closing file" : "End of file");
+    ESP_LOGI(TAG, "%s", result == TRACK_CHANGED ? "Track changed, closing file" : "End of file");
   }
   fclose(f);
   return result;

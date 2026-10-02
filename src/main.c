@@ -13,8 +13,11 @@
 
 static const char* TAG = "main";
 
+#define STARTUP_DELAY_MS 2000  // lets the serial monitor attach before the first logs
+#define CMD_QUEUE_LENGTH 10
+
 void app_main(void) {
-  vTaskDelay(pdMS_TO_TICKS(2000));
+  vTaskDelay(pdMS_TO_TICKS(STARTUP_DELAY_MS));
   esp_log_level_set("ssd1306", ESP_LOG_WARN);
 
   ESP_LOGI(TAG, "MP3 player starting up");
@@ -32,7 +35,7 @@ void app_main(void) {
   // Shared resources for all tasks touching the SD card / VS1053:
   // created here, in main.c, as the single owner, and passed in as
   // parameters to sd_card_scan_tracks() / audio_task_init() / vs1053_init().
-  QueueHandle_t cmd_queue = xQueueCreate(10, sizeof(player_cmd_t));
+  QueueHandle_t cmd_queue = xQueueCreate(CMD_QUEUE_LENGTH, sizeof(player_cmd_t));
   SemaphoreHandle_t spi_mutex = xSemaphoreCreateMutex();
 
   if (cmd_queue == NULL || spi_mutex == NULL) {

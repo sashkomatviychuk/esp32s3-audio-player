@@ -36,6 +36,36 @@ static const char* TAG = "VS1053";
 #define SM_SDINEW 0x0800
 #define SM_LINE1 0x4000
 #define SM_TESTS 0x0020
+#define SM_BASE_MODE (SM_LINE1 | SM_SDINEW)
+
+#define SCI_OPCODE_WRITE 0x02
+#define SCI_OPCODE_READ 0x03
+#define SCI_CMD_BITS 8
+#define SCI_ADDR_BITS 8
+#define SCI_DATA_BITS 16
+
+// ---- Configuration values ----
+#define SCI_CLOCK_HZ 800000  // SCI, slow, safe before clock configuration
+// Tried dropping this to 1MHz while HDAT0/HDAT1 stayed 0x0000 (decoder
+// never locking onto an MP3 frame) — made no difference, so the SDI
+// clock itself isn't the cause. Back to 6MHz.
+#define SDI_CLOCK_HZ 6000000  // SDI, after clock configuration in VS1053
+#define SPI_MAX_TRANSFER_SIZE 64
+#define RESET_LOW_MS 5
+#define RESET_SETTLE_MS 20
+#define AUDATA_44K1_STEREO 44101
+// EXPERIMENT: 0x9800 (SC_MULT=3.5x, SC_ADD=+2.0x) is the value most reference
+// libraries use; was 0x6000 (3.0x). Checking whether HDAT0/HDAT1 stay 0x0000
+// (decoder never locking onto MP3 frames) with a higher core clock.
+#define CLOCKF_VALUE 0x9800
+
+// SCI_VOL per-channel attenuation: 0x00 - loudest, 0xFE - silence
+#define VOL_LOUDEST 0x00
+#define VOL_QUIETEST_MAPPED 0x20  // volume 0% maps here; replaced with VOL_SILENCE
+#define VOL_SILENCE 0xFE
+#define VOLUME_PERCENT_MAX 100
+
+#define US_PER_MS 1000
 
 #define VS1053_MAX_SDI_CHUNK 32
 
@@ -56,7 +86,7 @@ static SemaphoreHandle_t s_spi_mutex = NULL;         // passed in externally (ma
 // forever — an unresponsive VS1053 (bad wiring, not powered, reset stuck)
 // must not be allowed to hang the calling task and trip the watchdog.
 static esp_err_t wait_dreq_high(const char* context) {
-  int64_t deadline_us = esp_timer_get_time() + ((int64_t)DREQ_WAIT_TIMEOUT_MS * 1000);
+  int64_t deadline_us = esp_timer_get_time() + ((int64_t)DREQ_WAIT_TIMEOUT_MS * US_PER_MS);
   while (!gpio_get_level(VS1053_PIN_DREQ)) {
     if (esp_timer_get_time() > deadline_us) {
       ESP_LOGE(TAG, "%s: DREQ still low after %dms, VS1053 may be unresponsive", context,
@@ -79,11 +109,11 @@ static esp_err_t vs1053_write_sci_locked(uint8_t addr, uint16_t data) {
   gpio_set_level(VS1053_PIN_XCS, 0);
 
   t.flags |= SPI_TRANS_USE_TXDATA;
-  t.cmd = 0x02;  // write
+  t.cmd = SCI_OPCODE_WRITE;
   t.addr = addr;
   t.tx_data[0] = (data >> 8) & 0xFF;
   t.tx_data[1] = data & 0xFF;
-  t.length = 16;
+  t.length = SCI_DATA_BITS;
 
   esp_err_t ret = spi_device_transmit(s_spi_low_speed, &t);
 
@@ -104,9 +134,9 @@ static esp_err_t vs1053_read_sci_locked(uint8_t addr, uint16_t* out_value) {
   gpio_set_level(VS1053_PIN_XCS, 0);
 
   t.flags |= SPI_TRANS_USE_RXDATA;
-  t.cmd = 0x03;  // read
+  t.cmd = SCI_OPCODE_READ;
   t.addr = addr;
-  t.length = 16;
+  t.length = SCI_DATA_BITS;
 
   esp_err_t ret = spi_device_transmit(s_spi_low_speed, &t);
 
@@ -141,6 +171,70 @@ void vs1053_deselect_early(void) {
   gpio_set_level(VS1053_PIN_XDCS, 1);
 
   ESP_LOGI(TAG, "XCS/XDCS deselected early (before SD card mount)");
+}
+
+// Adds both SPI devices, resets the chip and writes the base configuration.
+// Called with s_spi_mutex held; the caller releases it on every path.
+static esp_err_t setup_devices_and_codec(const spi_device_interface_config_t* devcfgLow) {
+  esp_err_t ret = spi_bus_add_device(VS1053_SPI_HOST, devcfgLow, &s_spi_low_speed);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "spi_bus_add_device (low speed) failed: %s", esp_err_to_name(ret));
+    return ret;
+  }
+
+  spi_device_interface_config_t devcfgHigh = *devcfgLow;
+  devcfgHigh.clock_speed_hz = SDI_CLOCK_HZ;
+  devcfgHigh.command_bits = 0;
+  devcfgHigh.address_bits = 0;
+
+  ret = spi_bus_add_device(VS1053_SPI_HOST, &devcfgHigh, &s_spi_high_speed);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "spi_bus_add_device (high speed) failed: %s", esp_err_to_name(ret));
+    return ret;
+  }
+
+  // --- Reset sequence ---
+  gpio_set_level(VS1053_PIN_XCS, 1);
+  gpio_set_level(VS1053_PIN_XDCS, 1);
+  gpio_set_level(VS1053_PIN_RESET, 0);
+  vTaskDelay(pdMS_TO_TICKS(RESET_LOW_MS));
+  gpio_set_level(VS1053_PIN_RESET, 1);
+  vTaskDelay(pdMS_TO_TICKS(RESET_SETTLE_MS));
+
+  // --- Base mode/clock/audata configuration ---
+  uint16_t mode = 0;
+  ret = vs1053_read_sci_locked(SCI_MODE, &mode);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to read SCI_MODE: %s", esp_err_to_name(ret));
+    return ret;
+  }
+  if (mode != SM_BASE_MODE) {
+    ESP_LOGW(TAG, "SCI_MODE was 0x%04X, expected 0x%04X — reconfiguring", mode, SM_BASE_MODE);
+    ret = vs1053_write_sci_locked(SCI_MODE, SM_BASE_MODE);
+    if (ret != ESP_OK) {
+      ESP_LOGE(TAG, "Failed to write SCI_MODE: %s", esp_err_to_name(ret));
+      return ret;
+    }
+  }
+
+  ret = vs1053_write_sci_locked(SCI_AUDATA, AUDATA_44K1_STEREO);  // 44.1kHz stereo
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to write SCI_AUDATA: %s", esp_err_to_name(ret));
+    return ret;
+  }
+
+  ret = vs1053_write_sci_locked(SCI_CLOCKF, CLOCKF_VALUE);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to write SCI_CLOCKF: %s", esp_err_to_name(ret));
+    return ret;
+  }
+
+  // Read CLOCKF back so the log proves which value is actually in the chip.
+  uint16_t clockfReadback = 0;
+  if (vs1053_read_sci_locked(SCI_CLOCKF, &clockfReadback) == ESP_OK) {
+    ESP_LOGI(TAG, "SCI_CLOCKF readback=0x%04X (wrote 0x%04X)", clockfReadback, CLOCKF_VALUE);
+  }
+  return ESP_OK;
 }
 
 esp_err_t vs1053_init(SemaphoreHandle_t spi_mutex) {
@@ -181,7 +275,7 @@ esp_err_t vs1053_init(SemaphoreHandle_t spi_mutex) {
       .sclk_io_num = VS1053_PIN_SCLK,
       .quadwp_io_num = -1,
       .quadhd_io_num = -1,
-      .max_transfer_sz = 64,
+      .max_transfer_sz = SPI_MAX_TRANSFER_SIZE,
   };
   esp_err_t ret = spi_bus_initialize(VS1053_SPI_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
   if (ret != ESP_OK) {
@@ -190,9 +284,9 @@ esp_err_t vs1053_init(SemaphoreHandle_t spi_mutex) {
   }
 
   spi_device_interface_config_t devcfg_low = {
-      .clock_speed_hz = 800000,  // SCI, slow, safe before clock configuration
-      .command_bits = 8,
-      .address_bits = 8,
+      .clock_speed_hz = SCI_CLOCK_HZ,
+      .command_bits = SCI_CMD_BITS,
+      .address_bits = SCI_ADDR_BITS,
       .dummy_bits = 0,
       .mode = 0,
       .spics_io_num = -1,  // XCS is driven manually via gpio_set_level
@@ -203,80 +297,11 @@ esp_err_t vs1053_init(SemaphoreHandle_t spi_mutex) {
   if (xSemaphoreTake(s_spi_mutex, portMAX_DELAY) != pdTRUE) {
     return ESP_FAIL;
   }
-
-  ret = spi_bus_add_device(VS1053_SPI_HOST, &devcfg_low, &s_spi_low_speed);
-  if (ret != ESP_OK) {
-    xSemaphoreGive(s_spi_mutex);
-    ESP_LOGE(TAG, "spi_bus_add_device (low speed) failed: %s", esp_err_to_name(ret));
-    return ret;
-  }
-
-  spi_device_interface_config_t devcfg_high = devcfg_low;
-  // Tried dropping this to 1MHz while HDAT0/HDAT1 stayed 0x0000 (decoder
-  // never locking onto an MP3 frame) — made no difference, so the SDI
-  // clock itself isn't the cause. Back to 6MHz.
-  devcfg_high.clock_speed_hz = 6000000;  // SDI, after clock configuration in VS1053
-  devcfg_high.command_bits = 0;
-  devcfg_high.address_bits = 0;
-
-  ret = spi_bus_add_device(VS1053_SPI_HOST, &devcfg_high, &s_spi_high_speed);
-  if (ret != ESP_OK) {
-    xSemaphoreGive(s_spi_mutex);
-    ESP_LOGE(TAG, "spi_bus_add_device (high speed) failed: %s", esp_err_to_name(ret));
-    return ret;
-  }
-
-  // --- Reset sequence ---
-  gpio_set_level(VS1053_PIN_XCS, 1);
-  gpio_set_level(VS1053_PIN_XDCS, 1);
-  gpio_set_level(VS1053_PIN_RESET, 0);
-  vTaskDelay(pdMS_TO_TICKS(5));
-  gpio_set_level(VS1053_PIN_RESET, 1);
-  vTaskDelay(pdMS_TO_TICKS(20));
-
-  // --- Base mode/clock/audata configuration ---
-  uint16_t mode = 0;
-  ret = vs1053_read_sci_locked(SCI_MODE, &mode);
-  if (ret != ESP_OK) {
-    xSemaphoreGive(s_spi_mutex);
-    ESP_LOGE(TAG, "Failed to read SCI_MODE: %s", esp_err_to_name(ret));
-    return ret;
-  }
-  if (mode != (SM_LINE1 | SM_SDINEW)) {
-    ESP_LOGW(TAG, "SCI_MODE was 0x%04X, expected 0x%04X — reconfiguring", mode,
-             (SM_LINE1 | SM_SDINEW));
-    ret = vs1053_write_sci_locked(SCI_MODE, (SM_LINE1 | SM_SDINEW));
-    if (ret != ESP_OK) {
-      xSemaphoreGive(s_spi_mutex);
-      ESP_LOGE(TAG, "Failed to write SCI_MODE: %s", esp_err_to_name(ret));
-      return ret;
-    }
-  }
-
-  ret = vs1053_write_sci_locked(SCI_AUDATA, 44101);  // 44.1kHz stereo
-  if (ret != ESP_OK) {
-    xSemaphoreGive(s_spi_mutex);
-    ESP_LOGE(TAG, "Failed to write SCI_AUDATA: %s", esp_err_to_name(ret));
-    return ret;
-  }
-
-  // EXPERIMENT: 0x9800 (SC_MULT=3.5x, SC_ADD=+2.0x) is the value most reference
-  // libraries use; was 0x6000 (3.0x). Checking whether HDAT0/HDAT1 stay 0x0000
-  // (decoder never locking onto MP3 frames) with a higher core clock.
-  ret = vs1053_write_sci_locked(SCI_CLOCKF, 0x9800);
-  if (ret != ESP_OK) {
-    xSemaphoreGive(s_spi_mutex);
-    ESP_LOGE(TAG, "Failed to write SCI_CLOCKF: %s", esp_err_to_name(ret));
-    return ret;
-  }
-
-  // Read CLOCKF back so the log proves which value is actually in the chip.
-  uint16_t clockf_readback = 0;
-  if (vs1053_read_sci_locked(SCI_CLOCKF, &clockf_readback) == ESP_OK) {
-    ESP_LOGI(TAG, "SCI_CLOCKF readback=0x%04X (wrote 0x9800)", clockf_readback);
-  }
-
+  ret = setup_devices_and_codec(&devcfg_low);
   xSemaphoreGive(s_spi_mutex);
+  if (ret != ESP_OK) {
+    return ret;
+  }
 
   ESP_LOGI(TAG, "VS1053 initialized (XCS=%d XDCS=%d DREQ=%d RESET=%d)", VS1053_PIN_XCS,
            VS1053_PIN_XDCS, VS1053_PIN_DREQ, VS1053_PIN_RESET);
@@ -333,9 +358,9 @@ esp_err_t vs1053_sine_test(uint32_t duration_ms) {
 
   // Force the loudest volume (0x0000) so a quiet/muted SCI_VOL can't be mistaken
   // for a hardware problem.
-  esp_err_t ret = vs1053_write_sci_locked(SCI_VOL, 0x0000);
+  esp_err_t ret = vs1053_write_sci_locked(SCI_VOL, VOL_LOUDEST);
   if (ret == ESP_OK) {
-    ret = vs1053_write_sci_locked(SCI_MODE, SM_SDINEW | SM_LINE1 | SM_TESTS);
+    ret = vs1053_write_sci_locked(SCI_MODE, SM_BASE_MODE | SM_TESTS);
   }
   if (ret == ESP_OK) {
     ret = vs1053_write_sdi(sine_start, sizeof(sine_start));
@@ -370,7 +395,7 @@ esp_err_t vs1053_sine_test(uint32_t duration_ms) {
   }
   ret = vs1053_write_sdi(sine_stop, sizeof(sine_stop));
   if (ret == ESP_OK) {
-    ret = vs1053_write_sci_locked(SCI_MODE, SM_SDINEW | SM_LINE1);  // leave test mode
+    ret = vs1053_write_sci_locked(SCI_MODE, SM_BASE_MODE);  // leave test mode
   }
   xSemaphoreGive(s_spi_mutex);
 
@@ -427,9 +452,9 @@ esp_err_t vs1053_set_volume(uint8_t vol) {
   }
 
   // 0..100 -> 0x00..0x20 per channel (0x00 - loudest, 0xFE - silence)
-  uint16_t value = (uint16_t)map_range(vol, 0, 100, 0x20, 0x00);
-  if (value == 0x20) {
-    value = 0xFE;
+  uint16_t value = (uint16_t)map_range(vol, 0, VOLUME_PERCENT_MAX, VOL_QUIETEST_MAPPED, VOL_LOUDEST);
+  if (value == VOL_QUIETEST_MAPPED) {
+    value = VOL_SILENCE;
   }
   value = (value << 8) | value;  // same for left and right channel
 

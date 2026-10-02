@@ -18,7 +18,7 @@ typedef struct {
  * duration = audio bytes * 8 / bitrate. Exact for CBR files, an estimate for
  * VBR. The elapsed time of a stream can be derived the same way:
  * (bytes sent - audio_start) * 8 / bitrate_bps. The file position is
- * restored to the start (rewind) before returning.
+ * restored to the start (fseek) before returning.
  *
  * Locking: reads from the SD card but takes no mutex — the caller must hold
  * spi_mutex (or be the only SD user at that moment).

@@ -21,6 +21,12 @@ static const char* TAG = "sd_card";
 #define PIN_NUM_CS 14
 #define MOUNT_POINT "/sdcard"
 
+#define SD_MAX_FREQ_KHZ 100        // see the speed history in try_mount()
+#define SD_WAIT_FOR_MISO_MS 100    // "card ready" polling window (driver default is 40)
+#define SD_MAX_OPEN_FILES 5
+#define SD_ALLOCATION_UNIT_SIZE 512  // FAT/SD sector size
+#define SPI_MAX_TRANSFER_SIZE 4000
+
 // -----------------------------------------------------------------
 // Module-private state (NOT extern, accessible only within this file)
 // -----------------------------------------------------------------
@@ -45,7 +51,7 @@ static esp_err_t init_bus(void) {
       .sclk_io_num = PIN_NUM_CLK,
       .quadwp_io_num = -1,
       .quadhd_io_num = -1,
-      .max_transfer_sz = 4000,
+      .max_transfer_sz = SPI_MAX_TRANSFER_SIZE,
   };
 
   // SPI2 bus for the SD card only. VS1053 initializes its own SPI3 bus in
@@ -77,7 +83,9 @@ esp_err_t sd_card_try_mount(void) {
   // Association's SD Card Formatter for cards >32GB / if Windows defaults to
   // exFAT) instead of relying on on-device formatting.
   esp_vfs_fat_sdmmc_mount_config_t mount_config = {
-      .format_if_mount_failed = false, .max_files = 5, .allocation_unit_size = 512};
+      .format_if_mount_failed = false,
+      .max_files = SD_MAX_OPEN_FILES,
+      .allocation_unit_size = SD_ALLOCATION_UNIT_SIZE};
 
   sdmmc_host_t host = SDSPI_HOST_DEFAULT();
   // The SD/VS1053 SPI bus runs on ~15-20cm breadboard wiring, which was
@@ -86,7 +94,7 @@ esp_err_t sd_card_try_mount(void) {
   // it reintroduced the same failure: mount succeeds, then a data CRC
   // error shows up mid-stream (sdspi_host: data CRC failed) and aborts
   // the read. Back to 100kHz, the speed this wiring actually holds up at.
-  host.max_freq_khz = 100;
+  host.max_freq_khz = SD_MAX_FREQ_KHZ;
   // IMPORTANT: do NOT set SDMMC_HOST_FLAG_SPI_IGNORE_DATA_CRC. It was tried
   // earlier to work around what looked like a bad CID/CSD checksum, but it
   // was masking a real failure: with CRC ignored, every data read/write
@@ -100,7 +108,7 @@ esp_err_t sd_card_try_mount(void) {
   // More headroom before giving up while polling MISO for "card ready"
   // (default is 40ms) — every command currently hits this timeout at least
   // once before the card responds.
-  slot_config.wait_for_miso = 100;
+  slot_config.wait_for_miso = SD_WAIT_FOR_MISO_MS;
 
   // The CSD (capacity) is read correctly now that data CRC is enforced — the
   // earlier "512KB" CSD was an artifact of SDMMC_HOST_FLAG_SPI_IGNORE_DATA_CRC

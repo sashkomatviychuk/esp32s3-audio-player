@@ -7,6 +7,8 @@
 static const char* TAG = "player_state";
 
 #define INITIAL_VOLUME 70
+#define VOLUME_MIN 0
+#define VOLUME_MAX 100
 
 // Guards s_state only. Held just long enough to copy a few fields — never
 // held across SPI / VS1053 / SD calls, so it cannot deadlock with spi_mutex.
@@ -61,10 +63,10 @@ void player_state_set_playback(playback_state_t playback) {
 uint8_t player_state_change_volume(int delta) {
   xSemaphoreTake(s_state_mutex, portMAX_DELAY);
   int volume = s_state.volume + delta;
-  if (volume > 100) {
-    volume = 100;
-  } else if (volume < 0) {
-    volume = 0;
+  if (volume > VOLUME_MAX) {
+    volume = VOLUME_MAX;
+  } else if (volume < VOLUME_MIN) {
+    volume = VOLUME_MIN;
   }
   uint8_t old_volume = s_state.volume;
   s_state.volume = (uint8_t)volume;

@@ -7,8 +7,44 @@
 
 static const char* TAG = "mp3_info";
 
+// ---- ID3v2 ----
 #define ID3_HEADER_SIZE 10
+#define ID3_SIZE_OFFSET 6      // 4 syncsafe size bytes follow "ID3", version and flags
+#define ID3_SIZE_BYTES 4
+#define ID3_SYNCSAFE_BITS 7    // the top bit of every size byte is always 0
+#define ID3_SYNCSAFE_MASK 0x7F
+
+// ---- MPEG audio frame header ----
 #define SYNC_SEARCH_LIMIT 1024  // bytes scanned after the ID3 tag for a frame sync
+#define FRAME_HEADER_SIZE 4
+#define FRAME_SYNC_BYTE 0xFF
+#define FRAME_SYNC_MASK 0xE0  // top 3 bits of the 2nd byte complete the 11-bit sync word
+#define MPEG_VERSION_2_5 0
+#define MPEG_VERSION_RESERVED 1
+#define MPEG_VERSION_2 2
+#define MPEG_VERSION_1 3
+#define LAYER_III 1
+#define BITRATE_IDX_FREE 0
+#define BITRATE_IDX_INVALID 15
+#define SAMPLE_RATE_IDX_RESERVED 3
+#define CHANNEL_MODE_MONO 3
+#define SAMPLES_PER_FRAME_MPEG1 1152
+#define SAMPLES_PER_FRAME_MPEG2 576
+
+// ---- Xing/Info tag (first frame of VBR/LAME files) ----
+// Offset after the frame header = Layer III side info size.
+#define SIDE_INFO_MPEG1_STEREO 32
+#define SIDE_INFO_MPEG1_MONO 17
+#define SIDE_INFO_MPEG2_STEREO 17
+#define SIDE_INFO_MPEG2_MONO 9
+#define XING_TAG_LEN 4
+#define XING_MIN_SIZE 12  // tag + flags + frame count
+#define XING_FLAGS_OFFSET 7
+#define XING_FLAG_FRAMES 0x01  // frame count field present
+#define XING_FRAMES_OFFSET 8
+
+#define BITS_PER_BYTE 8
+#define BITS_PER_KBIT 1000
 
 // Bitrates in kbps, indexed by the 4-bit bitrate field. 0 = free, -1 = invalid.
 static const int16_t BITRATE_MPEG1_L3[16] = {0,   32,  40,  48,  56,  64,  80,  96,
@@ -19,6 +55,106 @@ static const int16_t BITRATE_MPEG2_L3[16] = {0,  8,  16, 24,  32,  40,  48,  56,
 // Sample rates in Hz for MPEG1; MPEG2 is half of it, MPEG2.5 a quarter.
 static const uint32_t SAMPLE_RATE_MPEG1[3] = {44100, 48000, 32000};
 
+typedef struct {
+  int version;      // MPEG_VERSION_*
+  int layer;        // LAYER_III
+  int bitrateIdx;   // index into the bitrate tables
+  int sampleRateIdx;
+  int channelMode;  // CHANNEL_MODE_MONO = mono
+} frame_header_t;
+
+// Splits the 4 header bytes into fields (bit positions per the MPEG audio frame spec).
+static frame_header_t parse_frame_header(const uint8_t* b) {
+  frame_header_t h = {
+      .version = (b[1] >> 3) & 0x03,
+      .layer = (b[1] >> 1) & 0x03,
+      .bitrateIdx = (b[2] >> 4) & 0x0F,
+      .sampleRateIdx = (b[2] >> 2) & 0x03,
+      .channelMode = (b[3] >> 6) & 0x03,
+  };
+  return h;
+}
+
+// Reserved version, not Layer III, free/invalid bitrate — not usable for an estimate.
+static bool is_usable_frame(const frame_header_t* h) {
+  return h->version != MPEG_VERSION_RESERVED && h->layer == LAYER_III &&
+         h->bitrateIdx != BITRATE_IDX_FREE && h->bitrateIdx != BITRATE_IDX_INVALID;
+}
+
+// MPEG2 rates are half of MPEG1, MPEG2.5 a quarter.
+static int sample_rate_shift(int version) {
+  if (version == MPEG_VERSION_1) {
+    return 0;
+  }
+  return version == MPEG_VERSION_2 ? 1 : 2;
+}
+
+static size_t side_info_size(const frame_header_t* h) {
+  bool mono = h->channelMode == CHANNEL_MODE_MONO;
+  if (h->version == MPEG_VERSION_1) {
+    return mono ? SIDE_INFO_MPEG1_MONO : SIDE_INFO_MPEG1_STEREO;
+  }
+  return mono ? SIDE_INFO_MPEG2_MONO : SIDE_INFO_MPEG2_STEREO;
+}
+
+// Seeks to the start and returns the offset of the first audio byte (after an
+// ID3v2 tag, 0 if there is none). Returns false only if the seek failed.
+static bool read_audio_start(FILE* f, uint32_t* audioStart) {
+  *audioStart = 0;
+  if (fseek(f, 0, SEEK_SET) != 0) {
+    return false;
+  }
+  uint8_t header[ID3_HEADER_SIZE];
+  if (fread(header, 1, ID3_HEADER_SIZE, f) == ID3_HEADER_SIZE && memcmp(header, "ID3", 3) == 0) {
+    uint32_t tagSize = 0;
+    for (int i = 0; i < ID3_SIZE_BYTES; i++) {
+      tagSize = (tagSize << ID3_SYNCSAFE_BITS) | (header[ID3_SIZE_OFFSET + i] & ID3_SYNCSAFE_MASK);
+    }
+    *audioStart = ID3_HEADER_SIZE + tagSize;
+  }
+  return true;
+}
+
+// Finds the first usable Layer III frame header in buf[0..n).
+static bool find_first_frame(const uint8_t* buf, size_t n, size_t* pos, frame_header_t* header) {
+  for (size_t i = 0; i + FRAME_HEADER_SIZE <= n; i++) {
+    if (buf[i] != FRAME_SYNC_BYTE || (buf[i + 1] & FRAME_SYNC_MASK) != FRAME_SYNC_MASK) {
+      continue;
+    }
+    frame_header_t h = parse_frame_header(buf + i);
+    if (is_usable_frame(&h)) {
+      *pos = i;
+      *header = h;
+      return true;
+    }
+  }
+  return false;
+}
+
+// The first frame of a VBR/LAME file is often a Xing/Info frame holding the
+// total frame count — the exact length, unlike a bitrate-based estimate. Its
+// offset depends on version and channel mode (side info size).
+// Returns the length in seconds, 0 if there is no such tag.
+static uint32_t read_xing_duration(const uint8_t* buf, size_t n, size_t framePos,
+                                   const frame_header_t* h) {
+  if (h->sampleRateIdx == SAMPLE_RATE_IDX_RESERVED) {
+    return 0;
+  }
+  size_t tag = framePos + FRAME_HEADER_SIZE + side_info_size(h);
+  if (tag + XING_MIN_SIZE > n ||
+      (memcmp(buf + tag, "Xing", XING_TAG_LEN) != 0 && memcmp(buf + tag, "Info", XING_TAG_LEN) != 0) ||
+      (buf[tag + XING_FLAGS_OFFSET] & XING_FLAG_FRAMES) == 0) {
+    return 0;
+  }
+
+  const uint8_t* f = buf + tag + XING_FRAMES_OFFSET;
+  uint32_t frames = ((uint32_t)f[0] << 24) | ((uint32_t)f[1] << 16) | ((uint32_t)f[2] << 8) | f[3];
+  uint32_t sampleRate = SAMPLE_RATE_MPEG1[h->sampleRateIdx] >> sample_rate_shift(h->version);
+  uint32_t samplesPerFrame =
+      h->version == MPEG_VERSION_1 ? SAMPLES_PER_FRAME_MPEG1 : SAMPLES_PER_FRAME_MPEG2;
+  return (uint32_t)(((uint64_t)frames * samplesPerFrame) / sampleRate);
+}
+
 void mp3_get_info(FILE* f, size_t fileSize, mp3_info_t* out) {
   out->duration_sec = 0;
   out->bitrate_bps = 0;
@@ -28,74 +164,48 @@ void mp3_get_info(FILE* f, size_t fileSize, mp3_info_t* out) {
   }
 
   uint32_t audioStart = 0;
-  uint8_t header[ID3_HEADER_SIZE];
-  rewind(f);
-  if (fread(header, 1, ID3_HEADER_SIZE, f) == ID3_HEADER_SIZE && header[0] == 'I' &&
-      header[1] == 'D' && header[2] == '3') {
-    // Syncsafe size: 4 x 7 bits
-    audioStart = ID3_HEADER_SIZE + (((uint32_t)(header[6] & 0x7F) << 21) |
-                                    ((uint32_t)(header[7] & 0x7F) << 14) |
-                                    ((uint32_t)(header[8] & 0x7F) << 7) | (header[9] & 0x7F));
+  if (!read_audio_start(f, &audioStart)) {
+    ESP_LOGW(TAG, "fseek to start failed, duration unknown");
+    return;
   }
 
   uint32_t bitrate = 0;
-  uint32_t xingDurationSec = 0;  // exact length from a Xing/Info header, 0 if absent
+  uint32_t xingDurationSec = 0;           // exact length from a Xing/Info header, 0 if absent
   static uint8_t buf[SYNC_SEARCH_LIMIT];  // static: keeps the caller's task stack small
   if (fseek(f, (long)audioStart, SEEK_SET) == 0) {
     size_t n = fread(buf, 1, sizeof(buf), f);
-    for (size_t i = 0; i + 4 <= n; i++) {
-      if (buf[i] != 0xFF || (buf[i + 1] & 0xE0) != 0xE0) {
-        continue;
-      }
-      int version = (buf[i + 1] >> 3) & 0x03;  // 3 = MPEG1, 2 = MPEG2, 0 = MPEG2.5
-      int layer = (buf[i + 1] >> 1) & 0x03;    // 1 = Layer III
-      int idx = (buf[i + 2] >> 4) & 0x0F;
-      if (version == 1 || layer != 1 || idx == 0 || idx == 15) {
-        continue;  // reserved version, not Layer III, free/invalid bitrate
-      }
-      int kbps = version == 3 ? BITRATE_MPEG1_L3[idx] : BITRATE_MPEG2_L3[idx];
-      bitrate = (uint32_t)kbps * 1000;
-
-      // The first frame of a VBR/LAME file is often a Xing/Info frame holding
-      // the total frame count — the exact length, unlike a bitrate-based
-      // estimate. Its offset depends on version and channel mode (side info size).
-      int srIdx = (buf[i + 2] >> 2) & 0x03;
-      bool mono = ((buf[i + 3] >> 6) & 0x03) == 3;
-      if (srIdx < 3) {
-        int shift = version == 3 ? 0 : (version == 2 ? 1 : 2);
-        uint32_t sampleRate = SAMPLE_RATE_MPEG1[srIdx] >> shift;
-        uint32_t samplesPerFrame = version == 3 ? 1152 : 576;
-        size_t tag = i + 4 + (version == 3 ? (mono ? 17 : 32) : (mono ? 9 : 17));
-        bool isXing = tag + 12 <= n && (memcmp(buf + tag, "Xing", 4) == 0 ||
-                                        memcmp(buf + tag, "Info", 4) == 0);
-        if (isXing && (buf[tag + 7] & 0x01)) {  // flags: frame count present
-          uint32_t frames = ((uint32_t)buf[tag + 8] << 24) | ((uint32_t)buf[tag + 9] << 16) |
-                            ((uint32_t)buf[tag + 10] << 8) | buf[tag + 11];
-          xingDurationSec = (uint32_t)(((uint64_t)frames * samplesPerFrame) / sampleRate);
-        }
-      }
-      break;
+    size_t framePos = 0;
+    frame_header_t header;
+    if (find_first_frame(buf, n, &framePos, &header)) {
+      const int16_t* table = header.version == MPEG_VERSION_1 ? BITRATE_MPEG1_L3 : BITRATE_MPEG2_L3;
+      bitrate = (uint32_t)table[header.bitrateIdx] * BITS_PER_KBIT;
+      xingDurationSec = read_xing_duration(buf, n, framePos, &header);
     }
   }
-  rewind(f);
+  // The caller streams the file from the start next, so a failed seek is fatal for it too
+  if (fseek(f, 0, SEEK_SET) != 0) {
+    ESP_LOGW(TAG, "fseek back to start failed, duration unknown");
+    return;
+  }
 
   if (bitrate == 0 || fileSize <= audioStart) {
     ESP_LOGW(TAG, "Could not determine MP3 bitrate, duration unknown");
     return;
   }
 
+  uint64_t audioBits = (uint64_t)(fileSize - audioStart) * BITS_PER_BYTE;
   out->audio_start = audioStart;
   if (xingDurationSec > 0) {
     // Average bitrate, so elapsed (bytes -> seconds) also reaches the exact
     // length at the end of the file even for VBR.
     out->duration_sec = xingDurationSec;
-    out->bitrate_bps = (uint32_t)(((uint64_t)(fileSize - audioStart) * 8) / xingDurationSec);
+    out->bitrate_bps = (uint32_t)(audioBits / xingDurationSec);
     ESP_LOGI(TAG, "Xing/Info header: first-frame bitrate %u kbps, average %u kbps",
-             (unsigned)(bitrate / 1000), (unsigned)(out->bitrate_bps / 1000));
+             (unsigned)(bitrate / BITS_PER_KBIT), (unsigned)(out->bitrate_bps / BITS_PER_KBIT));
   } else {
     out->bitrate_bps = bitrate;
-    out->duration_sec = (uint32_t)(((uint64_t)(fileSize - audioStart) * 8) / bitrate);
+    out->duration_sec = (uint32_t)(audioBits / bitrate);
   }
-  ESP_LOGI(TAG, "Bitrate %u kbps, duration %us%s", (unsigned)(out->bitrate_bps / 1000),
+  ESP_LOGI(TAG, "Bitrate %u kbps, duration %us%s", (unsigned)(out->bitrate_bps / BITS_PER_KBIT),
            (unsigned)out->duration_sec, xingDurationSec > 0 ? " (Xing)" : " (estimate)");
 }
