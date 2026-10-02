@@ -12,7 +12,8 @@ static const char* TAG = "player_state";
 // held across SPI / VS1053 / SD calls, so it cannot deadlock with spi_mutex.
 static SemaphoreHandle_t s_state_mutex = NULL;
 static player_state_t s_state = {
-    .playback = PLAYBACK_STOPPED, .volume = INITIAL_VOLUME, .track_index = 0, .track_count = 0};
+    .playback = PLAYBACK_STOPPED, .volume = INITIAL_VOLUME, .track_index = 0, .track_count = 0,
+    .elapsed_sec = 0, .duration_sec = 0};
 
 esp_err_t player_state_init(void) {
   if (s_state_mutex != NULL) {
@@ -81,6 +82,8 @@ esp_err_t player_state_select_track(int index) {
   bool valid = index >= 0 && index < count;
   if (valid) {
     s_state.track_index = index;
+    s_state.elapsed_sec = 0;
+    s_state.duration_sec = 0;
   }
   xSemaphoreGive(s_state_mutex);
 
@@ -97,6 +100,8 @@ bool player_state_next_track(void) {
   bool moved = s_state.track_index + 1 < s_state.track_count;
   if (moved) {
     s_state.track_index++;
+    s_state.elapsed_sec = 0;
+    s_state.duration_sec = 0;
   }
   int index = s_state.track_index;
   xSemaphoreGive(s_state_mutex);
@@ -114,6 +119,8 @@ bool player_state_prev_track(void) {
   bool moved = s_state.track_index > 0;
   if (moved) {
     s_state.track_index--;
+    s_state.elapsed_sec = 0;
+    s_state.duration_sec = 0;
   }
   int index = s_state.track_index;
   xSemaphoreGive(s_state_mutex);
@@ -131,4 +138,11 @@ void player_state_set_track_count(int count) {
   s_state.track_count = count;
   xSemaphoreGive(s_state_mutex);
   ESP_LOGI(TAG, "Track count -> %d", count);
+}
+
+void player_state_set_progress(uint32_t elapsedSec, uint32_t durationSec) {
+  xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+  s_state.elapsed_sec = elapsedSec;
+  s_state.duration_sec = durationSec;
+  xSemaphoreGive(s_state_mutex);
 }

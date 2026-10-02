@@ -27,6 +27,7 @@ static const char* TAG = "VS1053";
 #define SCI_MODE 0x00
 #define SCI_STATUS 0x01
 #define SCI_CLOCKF 0x03
+#define SCI_DECODE_TIME 0x04
 #define SCI_AUDATA 0x05
 #define SCI_VOL 0x0B
 #define SCI_HDAT0 0x08
@@ -259,11 +260,20 @@ esp_err_t vs1053_init(SemaphoreHandle_t spi_mutex) {
     return ret;
   }
 
-  ret = vs1053_write_sci_locked(SCI_CLOCKF, (6 << 12));  // multiplier 3.0 (~12.2MHz)
+  // EXPERIMENT: 0x9800 (SC_MULT=3.5x, SC_ADD=+2.0x) is the value most reference
+  // libraries use; was 0x6000 (3.0x). Checking whether HDAT0/HDAT1 stay 0x0000
+  // (decoder never locking onto MP3 frames) with a higher core clock.
+  ret = vs1053_write_sci_locked(SCI_CLOCKF, 0x9800);
   if (ret != ESP_OK) {
     xSemaphoreGive(s_spi_mutex);
     ESP_LOGE(TAG, "Failed to write SCI_CLOCKF: %s", esp_err_to_name(ret));
     return ret;
+  }
+
+  // Read CLOCKF back so the log proves which value is actually in the chip.
+  uint16_t clockf_readback = 0;
+  if (vs1053_read_sci_locked(SCI_CLOCKF, &clockf_readback) == ESP_OK) {
+    ESP_LOGI(TAG, "SCI_CLOCKF readback=0x%04X (wrote 0x9800)", clockf_readback);
   }
 
   xSemaphoreGive(s_spi_mutex);
@@ -435,6 +445,47 @@ esp_err_t vs1053_set_volume(uint8_t vol) {
     } else {
       ESP_LOGE(TAG, "Failed to set volume: %s", esp_err_to_name(ret));
     }
+  }
+  return ret;
+}
+
+esp_err_t vs1053_get_decode_time(uint16_t* sec) {
+  if (s_spi_mutex == NULL) {
+    ESP_LOGE(TAG, "vs1053_get_decode_time: vs1053_init() not called yet");
+    return ESP_ERR_INVALID_STATE;
+  }
+  if (sec == NULL) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  esp_err_t ret = ESP_FAIL;
+  if (xSemaphoreTake(s_spi_mutex, portMAX_DELAY) == pdTRUE) {
+    ret = vs1053_read_sci_locked(SCI_DECODE_TIME, sec);
+    xSemaphoreGive(s_spi_mutex);
+  }
+  if (ret != ESP_OK) {
+    ESP_LOGW(TAG, "Failed to read decode time: %s", esp_err_to_name(ret));
+  }
+  return ret;
+}
+
+esp_err_t vs1053_reset_decode_time(void) {
+  if (s_spi_mutex == NULL) {
+    ESP_LOGE(TAG, "vs1053_reset_decode_time: vs1053_init() not called yet");
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  esp_err_t ret = ESP_FAIL;
+  if (xSemaphoreTake(s_spi_mutex, portMAX_DELAY) == pdTRUE) {
+    // The datasheet requires two consecutive writes to clear the counter.
+    ret = vs1053_write_sci_locked(SCI_DECODE_TIME, 0);
+    if (ret == ESP_OK) {
+      ret = vs1053_write_sci_locked(SCI_DECODE_TIME, 0);
+    }
+    xSemaphoreGive(s_spi_mutex);
+  }
+  if (ret != ESP_OK) {
+    ESP_LOGW(TAG, "Failed to reset decode time: %s", esp_err_to_name(ret));
   }
   return ret;
 }

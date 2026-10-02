@@ -2,10 +2,13 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/task.h"
 #include "player_state.h"
+#include "mp3_info.h"
 #include "player_types.h"
 #include "sd_card.h"
 #include "vs1053.h"
@@ -15,29 +18,10 @@ static const char* TAG = "audio_task";
 #define CHUNK_SIZE 32  // VS1053: 32-byte chunks over SPI
 #define AUDIO_TASK_STACK_SIZE 4096
 #define AUDIO_TASK_PRIORITY 5
+#define PROGRESS_UPDATE_PERIOD_US 500000  // how often elapsed time is read from the codec
 #define MAX_CONSECUTIVE_CODEC_ERRORS 10  // stop playback if VS1053 stays unresponsive
 
-// -----------------------------------------------------------------
-// Switch between "single-file debug" and "real project logic".
-//
-// AUDIO_DEBUG_MODE 1 — audio_task always plays AUDIO_DEBUG_FILENAME,
-//   ignoring any track list. This is the mode used for testing right
-//   now: set AUDIO_DEBUG_FILENAME to "demo_audio.mp3" or
-//   "demo_audio_2.mp3", rebuild — and the chosen file plays.
-//
-//   NOTE: Next/Prev/Select still update player_state's track_index in
-//   this mode (and restart the stream), but the file played stays
-//   AUDIO_DEBUG_FILENAME — don't be misled by the logged track index.
-//
-// AUDIO_DEBUG_MODE 0 — get_current_track_path() takes the path of the
-//   track at player_state's track_index from the SD module's track
-//   list (selection happens on SCREEN_LIST, architecture.md).
-//
-// One macro — one switch point, the rest of audio_task's code stays
-// the same regardless of the mode.
-// -----------------------------------------------------------------
-#define AUDIO_DEBUG_MODE 1
-#define AUDIO_DEBUG_FILENAME "demo_audio.mp3"
+// AUDIO_DEBUG_MODE / AUDIO_DEBUG_FILENAME are defined in audio_task.h
 
 // -----------------------------------------------------------------
 // Module-private state (NOT extern, accessible only within this file).
@@ -145,6 +129,19 @@ static track_result_t stream_current_track(void) {
   }
 
   ESP_LOGI(TAG, "Streaming %s", path);
+
+  // Track length for the display. Reads the file head, so it needs spi_mutex
+  // (the SD card shares the bus with the VS1053).
+  uint32_t durationSec = 0;
+  struct stat st;
+  if (stat(path, &st) == 0 && xSemaphoreTake(s_spi_mutex, portMAX_DELAY) == pdTRUE) {
+    durationSec = mp3_get_duration_sec(f, (size_t)st.st_size);
+    xSemaphoreGive(s_spi_mutex);
+  }
+  vs1053_reset_decode_time();  // takes spi_mutex internally
+  player_state_set_progress(0, durationSec);
+  int64_t lastProgressUs = esp_timer_get_time();
+
   player_state_set_playback(PLAYBACK_PLAYING);
 
   // Reference VS1053 libraries (e.g. Adafruit, esp-idf-vs1053) send a
@@ -235,6 +232,15 @@ static track_result_t stream_current_track(void) {
       }
       ESP_LOGI(TAG, "chunk %d (%d bytes): %s", total_chunks_logged, (int)bytes_to_send, hex);
       total_chunks_logged++;
+    }
+
+    // --- Publish the playback position for the display ---
+    if (esp_timer_get_time() - lastProgressUs >= PROGRESS_UPDATE_PERIOD_US) {
+      lastProgressUs = esp_timer_get_time();
+      uint16_t decodedSec = 0;
+      if (vs1053_get_decode_time(&decodedSec) == ESP_OK) {  // takes spi_mutex internally
+        player_state_set_progress(decodedSec, durationSec);
+      }
     }
 
     // --- Send to VS1053, under the mutex for the same SPI bus ---

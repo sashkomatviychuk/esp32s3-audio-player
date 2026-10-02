@@ -96,3 +96,27 @@ esp_err_t vs1053_sine_test(uint32_t duration_ms);
  *         been called yet, another esp_err_t on SPI/DREQ failure
  */
 esp_err_t vs1053_log_decode_status(void);
+
+/**
+ * @brief Reads SCI_DECODE_TIME — seconds of audio decoded since the last
+ *        reset (see vs1053_reset_decode_time()). Does not advance while the
+ *        stream is paused. Takes spi_mutex INTERNALLY — call it WITHOUT
+ *        holding the mutex externally beforehand.
+ *
+ * @param[out] sec Decoded seconds
+ *
+ * @return ESP_OK on success, ESP_ERR_INVALID_STATE if vs1053_init() hasn't
+ *         been called yet, ESP_ERR_INVALID_ARG if @p sec is NULL, another
+ *         esp_err_t on SPI/DREQ failure
+ */
+esp_err_t vs1053_get_decode_time(uint16_t* sec);
+
+/**
+ * @brief Resets SCI_DECODE_TIME to 0 (written twice, as the datasheet
+ *        requires). Call when a new track starts. Takes spi_mutex
+ *        INTERNALLY — call it WITHOUT holding the mutex externally.
+ *
+ * @return ESP_OK on success, ESP_ERR_INVALID_STATE if vs1053_init() hasn't
+ *         been called yet, another esp_err_t on SPI/DREQ failure
+ */
+esp_err_t vs1053_reset_decode_time(void);

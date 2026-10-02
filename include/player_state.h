@@ -13,6 +13,8 @@ typedef struct {
   uint8_t volume;   // 0..100
   int track_index;  // index into the SD track list
   int track_count;  // number of tracks found on the SD card
+  uint32_t elapsed_sec;   // playback position of the current track
+  uint32_t duration_sec;  // estimated track length, 0 if unknown
 } player_state_t;
 
 /**
@@ -86,3 +88,13 @@ bool player_state_prev_track(void);
 
 /** @brief Sets the number of available tracks. Locking: internal state mutex only. */
 void player_state_set_track_count(int count);
+
+/**
+ * @brief Publishes the playback position and the (estimated) track length.
+ *
+ * Called by audio_task. Locking: internal state mutex only.
+ *
+ * @param elapsedSec  Seconds played so far
+ * @param durationSec Track length in seconds, 0 if unknown
+ */
+void player_state_set_progress(uint32_t elapsedSec, uint32_t durationSec);
