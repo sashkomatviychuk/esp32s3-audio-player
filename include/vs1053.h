@@ -72,6 +72,19 @@ esp_err_t vs1053_write_sdi(const uint8_t* data, uint8_t bytes);
 esp_err_t vs1053_set_volume(uint8_t vol);
 
 /**
+ * @brief Diagnostic: makes the VS1053 generate a ~430Hz sine tone on its own
+ *        (SM_TESTS + datasheet sine test sequence), independent of MP3
+ *        decoding and the SD card. If the tone is audible, the clock, DAC
+ *        and headphone output are fine; if silent, the problem is the
+ *        crystal/analog supply/output wiring. Blocks for duration_ms.
+ *        Takes spi_mutex INTERNALLY — call it WITHOUT holding the mutex.
+ *
+ * @return ESP_OK on success, ESP_ERR_INVALID_STATE if vs1053_init() hasn't
+ *         been called yet, another esp_err_t on SPI/DREQ failure
+ */
+esp_err_t vs1053_sine_test(uint32_t duration_ms);
+
+/**
  * @brief Diagnostic helper: reads SCI_STATUS, SCI_HDAT0 and SCI_HDAT1 and
  *        logs them. SCI_HDAT0/1 are filled in by the decoder from the most
  *        recently parsed MPEG frame header — if they stay 0x0000 while

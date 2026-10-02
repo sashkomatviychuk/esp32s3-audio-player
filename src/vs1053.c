@@ -34,6 +34,7 @@ static const char* TAG = "VS1053";
 
 #define SM_SDINEW 0x0800
 #define SM_LINE1 0x4000
+#define SM_TESTS 0x0020
 
 #define VS1053_MAX_SDI_CHUNK 32
 
@@ -301,6 +302,75 @@ esp_err_t vs1053_write_sdi(const uint8_t* data, uint8_t bytes) {
   gpio_set_level(VS1053_PIN_XDCS, 1);
 
   return ret;
+}
+
+esp_err_t vs1053_sine_test(uint32_t duration_ms) {
+  if (s_spi_mutex == NULL) {
+    ESP_LOGE(TAG, "vs1053_sine_test: vs1053_init() not called yet");
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  // Sine test sequences from the VS1053 datasheet ("SDI Tests"). n = 0xC5:
+  // Fs index 6 (11025 Hz), skip speed 5 -> 11025 * 5 / 128 ~= 430Hz tone.
+  // A low frequency on purpose: cheap multimeters read AC accurately only up
+  // to ~400Hz-1kHz, so a ~5kHz tone looked like "no signal" on the meter.
+  static const uint8_t sine_start[8] = {0x53, 0xEF, 0x6E, 0xC5, 0x00, 0x00, 0x00, 0x00};
+  static const uint8_t sine_stop[8] = {0x45, 0x78, 0x69, 0x74, 0x00, 0x00, 0x00, 0x00};
+
+  if (xSemaphoreTake(s_spi_mutex, portMAX_DELAY) != pdTRUE) {
+    return ESP_FAIL;
+  }
+
+  // Force the loudest volume (0x0000) so a quiet/muted SCI_VOL can't be mistaken
+  // for a hardware problem.
+  esp_err_t ret = vs1053_write_sci_locked(SCI_VOL, 0x0000);
+  if (ret == ESP_OK) {
+    ret = vs1053_write_sci_locked(SCI_MODE, SM_SDINEW | SM_LINE1 | SM_TESTS);
+  }
+  if (ret == ESP_OK) {
+    ret = vs1053_write_sdi(sine_start, sizeof(sine_start));
+  }
+
+  // Read the registers back while the tone is (supposed to be) playing: shows
+  // whether writes actually stick (SCI write path) and what the chip is set to.
+  if (ret == ESP_OK) {
+    uint16_t mode = 0, vol = 0, clockf = 0, audata = 0, status = 0;
+    vs1053_read_sci_locked(SCI_MODE, &mode);
+    vs1053_read_sci_locked(SCI_VOL, &vol);
+    vs1053_read_sci_locked(SCI_CLOCKF, &clockf);
+    vs1053_read_sci_locked(SCI_AUDATA, &audata);
+    vs1053_read_sci_locked(SCI_STATUS, &status);
+    ESP_LOGI(TAG,
+             "Sine test regs: MODE=0x%04X (want 0x4820) VOL=0x%04X (want 0x0000) "
+             "CLOCKF=0x%04X (want 0x6000) AUDATA=0x%04X STATUS=0x%04X",
+             mode, vol, clockf, audata, status);
+  }
+  xSemaphoreGive(s_spi_mutex);
+
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Sine test: failed to start: %s", esp_err_to_name(ret));
+    return ret;
+  }
+
+  ESP_LOGI(TAG, "Sine test running (~430Hz) for %u ms — listen to the output", (unsigned)duration_ms);
+  vTaskDelay(pdMS_TO_TICKS(duration_ms));
+
+  if (xSemaphoreTake(s_spi_mutex, portMAX_DELAY) != pdTRUE) {
+    return ESP_FAIL;
+  }
+  ret = vs1053_write_sdi(sine_stop, sizeof(sine_stop));
+  if (ret == ESP_OK) {
+    ret = vs1053_write_sci_locked(SCI_MODE, SM_SDINEW | SM_LINE1);  // leave test mode
+  }
+  xSemaphoreGive(s_spi_mutex);
+
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Sine test: failed to stop: %s", esp_err_to_name(ret));
+    return ret;
+  }
+
+  ESP_LOGI(TAG, "Sine test finished");
+  return ESP_OK;
 }
 
 esp_err_t vs1053_log_decode_status(void) {
