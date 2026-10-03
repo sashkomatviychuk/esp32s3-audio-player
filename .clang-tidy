@@ -4,6 +4,7 @@ Checks: >
   bugprone-*,
   -readability-magic-numbers,
   -readability-identifier-length,
+  -readability-implicit-bool-conversion,
   -bugprone-easily-swappable-parameters
 
 WarningsAsErrors: ""
@@ -22,6 +23,21 @@ CheckOptions:
     value: lower_case
   - key: readability-identifier-naming.LocalVariableCase
     value: lower_case
+
+  # ESP-IDF logging tag (static const char* TAG) is a conventional exception
+  - key: readability-identifier-naming.VariableIgnoredRegexp
+    value: '^TAG$'
+
+  # File-scope constant tables are UPPER_CASE (ICON_PLAY, BITRATE_MPEG1_L3)
+  - key: readability-identifier-naming.GlobalConstantCase
+    value: UPPER_CASE
+  - key: readability-identifier-naming.StaticConstantCase
+    value: UPPER_CASE
+  # ...except s_-prefixed module-private statics (s_views dispatch table)
+  - key: readability-identifier-naming.GlobalConstantIgnoredRegexp
+    value: '^s_[a-z0-9_]+$'
+  - key: readability-identifier-naming.StaticConstantIgnoredRegexp
+    value: '^s_[a-z0-9_]+$'
 
   # Macros and constants: UPPER_CASE (VS1053_PIN_CS, DISPLAY_WIDTH)
   - key: readability-identifier-naming.MacroDefinitionCase

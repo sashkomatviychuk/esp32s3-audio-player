@@ -349,8 +349,8 @@ esp_err_t vs1053_sine_test(uint32_t duration_ms) {
   // Fs index 6 (11025 Hz), skip speed 5 -> 11025 * 5 / 128 ~= 430Hz tone.
   // A low frequency on purpose: cheap multimeters read AC accurately only up
   // to ~400Hz-1kHz, so a ~5kHz tone looked like "no signal" on the meter.
-  static const uint8_t sine_start[8] = {0x53, 0xEF, 0x6E, 0xC5, 0x00, 0x00, 0x00, 0x00};
-  static const uint8_t sine_stop[8] = {0x45, 0x78, 0x69, 0x74, 0x00, 0x00, 0x00, 0x00};
+  static const uint8_t SINE_START[8] = {0x53, 0xEF, 0x6E, 0xC5, 0x00, 0x00, 0x00, 0x00};
+  static const uint8_t SINE_STOP[8] = {0x45, 0x78, 0x69, 0x74, 0x00, 0x00, 0x00, 0x00};
 
   if (xSemaphoreTake(s_spi_mutex, portMAX_DELAY) != pdTRUE) {
     return ESP_FAIL;
@@ -363,7 +363,7 @@ esp_err_t vs1053_sine_test(uint32_t duration_ms) {
     ret = vs1053_write_sci_locked(SCI_MODE, SM_BASE_MODE | SM_TESTS);
   }
   if (ret == ESP_OK) {
-    ret = vs1053_write_sdi(sine_start, sizeof(sine_start));
+    ret = vs1053_write_sdi(SINE_START, sizeof(SINE_START));
   }
 
   // Read the registers back while the tone is (supposed to be) playing: shows
@@ -393,7 +393,7 @@ esp_err_t vs1053_sine_test(uint32_t duration_ms) {
   if (xSemaphoreTake(s_spi_mutex, portMAX_DELAY) != pdTRUE) {
     return ESP_FAIL;
   }
-  ret = vs1053_write_sdi(sine_stop, sizeof(sine_stop));
+  ret = vs1053_write_sdi(SINE_STOP, sizeof(SINE_STOP));
   if (ret == ESP_OK) {
     ret = vs1053_write_sci_locked(SCI_MODE, SM_BASE_MODE);  // leave test mode
   }
