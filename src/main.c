@@ -1,11 +1,11 @@
 #include "audio_task.h"
 #include "display_task.h"
-#include "driver/spi_common.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "input_task.h"
 #include "player_state.h"
 #include "player_types.h"
 #include "sd_card.h"
@@ -73,9 +73,10 @@ void app_main(void) {
     ESP_LOGE(TAG, "display_task_init failed, continuing without display");
   }
 
-  // --- example: sending a command from outside
-  //     (in the real project — from vInputTask / vBLETask,
-  //     which will also receive cmd_queue as a parameter at init) ---
-  // player_cmd_t cmd = { .type = CMD_PLAY_PAUSE };
-  // xQueueSend(cmd_queue, &cmd, portMAX_DELAY);
+  // Buttons only send commands to cmd_queue; the player works without them.
+  if (input_task_init(cmd_queue) != ESP_OK) {
+    ESP_LOGE(TAG, "input_task_init failed, continuing without buttons");
+  }
+
+  // ble_task_init(cmd_queue) will be added here the same way.
 }

@@ -30,7 +30,7 @@
  *        and creates vAudioTask.
  *
  * @param cmd_queue   Shared command Queue (created in main.c,
- *                    written to by vInputTask and vBLETask)
+ *                    written to by input_task and ble_task)
  * @param spi_mutex   Mutex protecting the shared SPI bus (VS1053 + SD card)
  *
  * Init-order dependencies: the SD card must be mounted (sd_card_init), the

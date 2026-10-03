@@ -20,6 +20,7 @@ Diagnostics:
   Suppress:
     - pp_file_not_found
     - err_file_not_found
+    - attribute_section_invalid_for_target  # IRAM_ATTR: host clang targets Mach-O, device is ELF
 
 Index:
   Background: Build
