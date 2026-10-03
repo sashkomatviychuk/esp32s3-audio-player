@@ -175,19 +175,19 @@ void vs1053_deselect_early(void) {
 
 // Adds both SPI devices, resets the chip and writes the base configuration.
 // Called with s_spi_mutex held; the caller releases it on every path.
-static esp_err_t setup_devices_and_codec(const spi_device_interface_config_t* devcfgLow) {
-  esp_err_t ret = spi_bus_add_device(VS1053_SPI_HOST, devcfgLow, &s_spi_low_speed);
+static esp_err_t setup_devices_and_codec(const spi_device_interface_config_t* devcfg_low) {
+  esp_err_t ret = spi_bus_add_device(VS1053_SPI_HOST, devcfg_low, &s_spi_low_speed);
   if (ret != ESP_OK) {
     ESP_LOGE(TAG, "spi_bus_add_device (low speed) failed: %s", esp_err_to_name(ret));
     return ret;
   }
 
-  spi_device_interface_config_t devcfgHigh = *devcfgLow;
-  devcfgHigh.clock_speed_hz = SDI_CLOCK_HZ;
-  devcfgHigh.command_bits = 0;
-  devcfgHigh.address_bits = 0;
+  spi_device_interface_config_t devcfg_high = *devcfg_low;
+  devcfg_high.clock_speed_hz = SDI_CLOCK_HZ;
+  devcfg_high.command_bits = 0;
+  devcfg_high.address_bits = 0;
 
-  ret = spi_bus_add_device(VS1053_SPI_HOST, &devcfgHigh, &s_spi_high_speed);
+  ret = spi_bus_add_device(VS1053_SPI_HOST, &devcfg_high, &s_spi_high_speed);
   if (ret != ESP_OK) {
     ESP_LOGE(TAG, "spi_bus_add_device (high speed) failed: %s", esp_err_to_name(ret));
     return ret;
@@ -230,9 +230,9 @@ static esp_err_t setup_devices_and_codec(const spi_device_interface_config_t* de
   }
 
   // Read CLOCKF back so the log proves which value is actually in the chip.
-  uint16_t clockfReadback = 0;
-  if (vs1053_read_sci_locked(SCI_CLOCKF, &clockfReadback) == ESP_OK) {
-    ESP_LOGI(TAG, "SCI_CLOCKF readback=0x%04X (wrote 0x%04X)", clockfReadback, CLOCKF_VALUE);
+  uint16_t clockf_readback = 0;
+  if (vs1053_read_sci_locked(SCI_CLOCKF, &clockf_readback) == ESP_OK) {
+    ESP_LOGI(TAG, "SCI_CLOCKF readback=0x%04X (wrote 0x%04X)", clockf_readback, CLOCKF_VALUE);
   }
   return ESP_OK;
 }

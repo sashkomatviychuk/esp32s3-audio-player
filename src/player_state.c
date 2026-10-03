@@ -155,9 +155,9 @@ void player_state_set_sd_present(bool present) {
   ESP_LOGI(TAG, "SD present -> %d", present);
 }
 
-void player_state_set_progress(uint32_t elapsedSec, uint32_t durationSec) {
+void player_state_set_progress(uint32_t elapsed_sec, uint32_t duration_sec) {
   xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-  s_state.elapsed_sec = elapsedSec;
-  s_state.duration_sec = durationSec;
+  s_state.elapsed_sec = elapsed_sec;
+  s_state.duration_sec = duration_sec;
   xSemaphoreGive(s_state_mutex);
 }

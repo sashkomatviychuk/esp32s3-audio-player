@@ -11,25 +11,25 @@ WarningsAsErrors: ""
 HeaderFilterRegex: "^(src|include)/.*"
 
 CheckOptions:
-  # HAL functions: Module_Action -> PascalCase (HAL_UART_Init, MX_GPIO_Init)
+  # Functions: not enforced (ESP-IDF snake_case by convention)
   - key: readability-identifier-naming.FunctionCase
     value: aNy_CasE
 
-  # Variables: camelCase (uartBusy, adcBuffer)
+  # Variables: snake_case (spi_mutex, cmd_queue)
   - key: readability-identifier-naming.VariableCase
-    value: camelCase
+    value: lower_case
   - key: readability-identifier-naming.ParameterCase
-    value: camelCase
+    value: lower_case
   - key: readability-identifier-naming.LocalVariableCase
-    value: camelCase
+    value: lower_case
 
-  # Macros and constants: UPPER_CASE (ADC_BUF_SIZE, GPIO_PIN_0)
+  # Macros and constants: UPPER_CASE (VS1053_PIN_CS, DISPLAY_WIDTH)
   - key: readability-identifier-naming.MacroDefinitionCase
     value: UPPER_CASE
   - key: readability-identifier-naming.EnumConstantCase
     value: UPPER_CASE
 
-  # Structs/typedefs: PascalCase (ADC_HandleTypeDef, GPIO_InitTypeDef)
+  # Structs/typedefs: not enforced (snake_case with _t suffix by convention)
   - key: readability-identifier-naming.TypedefCase
     value: aNy_CasE
   - key: readability-identifier-naming.StructCase

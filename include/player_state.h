@@ -102,7 +102,7 @@ void player_state_set_sd_present(bool present);
  *
  * Called by audio_task. Locking: internal state mutex only.
  *
- * @param elapsedSec  Seconds played so far
- * @param durationSec Track length in seconds, 0 if unknown
+ * @param elapsed_sec  Seconds played so far
+ * @param duration_sec Track length in seconds, 0 if unknown
  */
-void player_state_set_progress(uint32_t elapsedSec, uint32_t durationSec);
+void player_state_set_progress(uint32_t elapsed_sec, uint32_t duration_sec);

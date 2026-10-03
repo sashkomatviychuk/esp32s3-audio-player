@@ -2,6 +2,7 @@
 
 #include "audio_task.h"
 #include "display.h"
+#include "display_views.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -13,10 +14,13 @@ static const char* TAG = "display_task";
 #define DISPLAY_TASK_PRIORITY 3  // below audio_task (5)
 #define DISPLAY_PERIOD_MS 250
 
-static bool state_changed(const player_state_t* a, const player_state_t* b) {
-  return a->playback != b->playback || a->volume != b->volume || a->track_index != b->track_index ||
-         a->track_count != b->track_count || a->elapsed_sec != b->elapsed_sec ||
-         a->duration_sec != b->duration_sec || a->sd_present != b->sd_present;
+static bool state_changed(const player_state_t* curr_state, const player_state_t* last_state) {
+  return curr_state->playback != last_state->playback || curr_state->volume != last_state->volume ||
+         curr_state->track_index != last_state->track_index ||
+         curr_state->track_count != last_state->track_count ||
+         curr_state->elapsed_sec != last_state->elapsed_sec ||
+         curr_state->duration_sec != last_state->duration_sec ||
+         curr_state->sd_present != last_state->sd_present;
 }
 
 // The single place with routing rules: which view the current state calls for.
@@ -29,29 +33,29 @@ static display_view_t select_view(const player_state_t* state) {
 
 static void display_task(void* arg) {
   player_state_t last = {0};
-  display_view_t lastView = DISPLAY_VIEW_PLAYER;
-  bool firstFrame = true;
-  TickType_t lastWake = xTaskGetTickCount();
+  display_view_t last_view = DISPLAY_VIEW_PLAYER;
+  bool first_frame = true;
+  TickType_t last_wake = xTaskGetTickCount();
 
   while (1) {
-    player_state_t now;
-    player_state_get(&now);
-    display_view_t view = select_view(&now);
+    player_state_t curr_player_state;
+    player_state_get(&curr_player_state);
+    display_view_t view = select_view(&curr_player_state);
 
-    if (firstFrame || view != lastView || state_changed(&now, &last)) {
+    if (first_frame || view != last_view || state_changed(&curr_player_state, &last)) {
       display_clear();
-      display_render_view(view, &now);
+      display_render_view(view, &curr_player_state);
       esp_err_t ret = display_flush();
       if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Display flush failed: %s", esp_err_to_name(ret));
       } else {
-        last = now;
-        lastView = view;
-        firstFrame = false;
+        last = curr_player_state;
+        last_view = view;
+        first_frame = false;
       }
     }
 
-    vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(DISPLAY_PERIOD_MS));
+    vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(DISPLAY_PERIOD_MS));
   }
 }
 

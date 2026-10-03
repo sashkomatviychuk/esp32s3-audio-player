@@ -25,8 +25,8 @@ static const char* TAG = "audio_task";
 #define CODEC_FILLER_BYTES 10             // zero bytes sent before the first MP3 data
 #define PATH_EXTRA_CHARS 16               // room for "<mount point>/" around a track name
 #define BITS_PER_BYTE 8
-#define DEBUG_DUMP_CHUNKS 5               // first chunks hex-dumped after reading from the SD
-#define YIELD_EVERY_N_CHUNKS 32           // taskYIELD() cadence, keeps the watchdog fed
+#define DEBUG_DUMP_CHUNKS 5                   // first chunks hex-dumped after reading from the SD
+#define YIELD_EVERY_N_CHUNKS 32               // taskYIELD() cadence, keeps the watchdog fed
 #define DECODE_STATUS_LOG_EVERY_N_CHUNKS 200  // ~every 1.5s of audio at 128kbps
 
 // 2048 reintroduced the SD CRC failures sd-card-issues.md already fixed
@@ -104,7 +104,8 @@ static bool handle_cmd(const player_cmd_t* cmd) {
     case CMD_VOLUME_UP:
     case CMD_VOLUME_DOWN: {
       uint8_t old_volume = player_state_get_volume();
-      uint8_t volume = player_state_change_volume(cmd->type == CMD_VOLUME_UP ? VOLUME_STEP : -VOLUME_STEP);
+      uint8_t volume =
+          player_state_change_volume(cmd->type == CMD_VOLUME_UP ? VOLUME_STEP : -VOLUME_STEP);
       if (volume == old_volume) {
         break;  // already at a limit (player_state logged the warning)
       }
@@ -170,9 +171,9 @@ static track_result_t stream_current_track(void) {
   // decode-time register is not usable while the decoder does not lock on).
   // DREQ paces the transfer, so this follows real playback; pause is
   // accounted for automatically because no bytes are sent while paused.
-  uint64_t bytesSent = 0;
+  uint64_t bytes_sent = 0;
   player_state_set_progress(0, info.duration_sec);
-  int64_t lastProgressUs = esp_timer_get_time();
+  int64_t last_progress_us = esp_timer_get_time();
 
   player_state_set_playback(PLAYBACK_PLAYING);
 
@@ -186,7 +187,7 @@ static track_result_t stream_current_track(void) {
   int chunks_sent = 0;
   int total_chunks_logged = 0;
   track_result_t result = TRACK_FINISHED;
-  bool reachedEof = false;
+  bool reached_eof = false;
   bool read_error = false;  // the loop ended on an SD read error, not a real EOF
   int read_errno = 0;
 
@@ -234,7 +235,7 @@ static track_result_t stream_current_track(void) {
           read_error = true;
           read_errno = errno;
         } else {
-          reachedEof = true;
+          reached_eof = true;
         }
         break;
       }
@@ -261,10 +262,11 @@ static track_result_t stream_current_track(void) {
 
     // --- Publish the playback position for the display ---
     if (info.bitrate_bps > 0 &&
-        esp_timer_get_time() - lastProgressUs >= PROGRESS_UPDATE_PERIOD_US) {
-      lastProgressUs = esp_timer_get_time();
-      uint64_t audioBytes = bytesSent > info.audio_start ? bytesSent - info.audio_start : 0;
-      player_state_set_progress((uint32_t)(audioBytes * BITS_PER_BYTE / info.bitrate_bps), info.duration_sec);
+        esp_timer_get_time() - last_progress_us >= PROGRESS_UPDATE_PERIOD_US) {
+      last_progress_us = esp_timer_get_time();
+      uint64_t audio_bytes = bytes_sent > info.audio_start ? bytes_sent - info.audio_start : 0;
+      player_state_set_progress((uint32_t)(audio_bytes * BITS_PER_BYTE / info.bitrate_bps),
+                                info.duration_sec);
     }
 
     // --- Send to VS1053, under the mutex for the same SPI bus ---
@@ -275,7 +277,7 @@ static track_result_t stream_current_track(void) {
     }
     read_buf_pos += bytes_to_send;
     if (codec_ret == ESP_OK) {
-      bytesSent += bytes_to_send;
+      bytes_sent += bytes_to_send;
     }
 
     if (codec_ret != ESP_OK) {
@@ -311,7 +313,7 @@ static track_result_t stream_current_track(void) {
   } else {
     // The periodic update can lag up to PROGRESS_UPDATE_PERIOD_US and the byte
     // count is rounded down, so snap to the full length once the file is done.
-    if (reachedEof && info.duration_sec > 0) {
+    if (reached_eof && info.duration_sec > 0) {
       player_state_set_progress(info.duration_sec, info.duration_sec);
     }
 

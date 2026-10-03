@@ -1,7 +1,11 @@
 #pragma once
 
+#include <stdint.h>
+
 #include "esp_err.h"
-#include "player_state.h"
+
+#define DISPLAY_WIDTH 128
+#define GLYPH_SIZE 8
 
 /**
  * @brief Initializes the I2C bus (I2C_NUM_0, SDA 17 / SCL 18) and the 128x64
@@ -17,41 +21,34 @@
  */
 esp_err_t display_init(void);
 
-/**
- * Full-screen layouts the display can show. To add a view: add a value here
- * (before DISPLAY_VIEW_COUNT), a render function + table entry in display.c,
- * and a routing rule in select_view() in display_task.c.
- */
-typedef enum {
-  DISPLAY_VIEW_PLAYER = 0,  // header + track list
-  DISPLAY_VIEW_NO_SD,       // "Please insert SD card" warning
-  DISPLAY_VIEW_COUNT
-} display_view_t;
-
 /** @brief Clears the framebuffer (RAM only, the panel is not touched). */
 void display_clear(void);
 
 /** @brief Sends the framebuffer to the panel over I2C. */
 esp_err_t display_flush(void);
 
-/**
- * @brief Draws a whole screen for @p view into the framebuffer (the caller
- *        clears before and flushes after). Unknown views are ignored with a
- *        warning. Framebuffer only.
- */
-void display_render_view(display_view_t view, const player_state_t* state);
+// ---- Drawing primitives (framebuffer only, no-ops before display_init) ----
 
 /**
- * @brief Draws the first row: "MM:SS/MM:SS" (or "--:--" for an unknown
- *        duration), a play/pause/stop icon, a debug marker (only when
- *        AUDIO_DEBUG_MODE is on) and the volume bar. Framebuffer only.
+ * @brief Draws up to @p max_chars characters of @p text with the 8x8 Latin
+ *        font at (x, y). Characters outside the font are drawn as '?'.
  */
-void display_render_header(const player_state_t* state);
+void display_draw_text(int x, int y, const char* text, int max_chars);
+
+/** @brief Draws @p text horizontally centered on the row at @p y. */
+void display_draw_text_centered(int y, const char* text);
+
+/** @brief Draws a 1px frame with rounded corners. */
+void display_draw_rounded_frame(int x, int y, int w, int h);
+
+/** @brief Draws a progress bar outline filled to @p percent (0-100). */
+void display_draw_bar(int x, int y, int w, int h, int percent);
+
+/** @brief Draws a full-width horizontal line at @p y. */
+void display_draw_hline(int y);
 
 /**
- * @brief Draws the track list below the header: up to 5 rows, names cut to
- *        the row width, the current track in a rounded frame. The visible
- *        window follows state->track_index. Reads names from the SD module's
- *        in-memory list (no SD access, no mutex). Framebuffer only.
+ * @brief Draws a 1-bit bitmap, row-major, MSB = leftmost pixel (the format of
+ *        ssd1306_set_bitmap), @p w x @p h pixels at (x, y).
  */
-void display_render_list(const player_state_t* state);
+void display_draw_bitmap(int x, int y, const uint8_t* bitmap, int w, int h);

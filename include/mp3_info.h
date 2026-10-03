@@ -24,7 +24,7 @@ typedef struct {
  * spi_mutex (or be the only SD user at that moment).
  *
  * @param f        Open file, positioned anywhere
- * @param fileSize Total file size in bytes
+ * @param file_size Total file size in bytes
  * @param[out] out Result; all fields are 0 if the header could not be parsed
  */
-void mp3_get_info(FILE* f, size_t fileSize, mp3_info_t* out);
+void mp3_get_info(FILE* f, size_t file_size, mp3_info_t* out);
