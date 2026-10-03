@@ -5,6 +5,7 @@
 
 #include "driver/gpio.h"
 #include "esp_attr.h"
+#include "esp_intr_alloc.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "player_types.h"
@@ -27,7 +28,10 @@ typedef struct {
 } button_cfg_t;
 
 // Active-low: the other contact of every button goes to GND.
-static const button_cfg_t s_buttons[] = {
+// DRAM_ATTR: button_isr() is IRAM-safe and reads this table while the flash
+// cache may be disabled (NVS writes by the BLE stack), so it must not live in
+// flash-mapped .rodata.
+static const DRAM_ATTR button_cfg_t s_buttons[] = {
     {.pin = GPIO_NUM_1, .cmd = CMD_PLAY_PAUSE, .repeat = false},
     {.pin = GPIO_NUM_2, .cmd = CMD_NEXT, .repeat = false},
     {.pin = GPIO_NUM_42, .cmd = CMD_PREV, .repeat = false},
@@ -161,7 +165,9 @@ esp_err_t input_task_init(QueueHandle_t cmd_queue) {
     return err;
   }
 
-  err = gpio_install_isr_service(0);
+  // ESP_INTR_FLAG_IRAM: the BLE stack uses NVS, so flash can be written at run
+  // time and the ISR must keep working while the flash cache is disabled.
+  err = gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
   if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
     ESP_LOGE(TAG, "gpio_install_isr_service failed: %s", esp_err_to_name(err));
     return err;

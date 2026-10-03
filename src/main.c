@@ -1,4 +1,5 @@
 #include "audio_task.h"
+#include "ble_task.h"
 #include "display_task.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -78,5 +79,8 @@ void app_main(void) {
     ESP_LOGE(TAG, "input_task_init failed, continuing without buttons");
   }
 
-  // ble_task_init(cmd_queue) will be added here the same way.
+  // BLE only sends commands to cmd_queue; the player works without it.
+  if (ble_task_init(cmd_queue) != ESP_OK) {
+    ESP_LOGE(TAG, "ble_task_init failed, continuing without BLE");
+  }
 }
