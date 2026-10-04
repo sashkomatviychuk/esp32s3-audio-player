@@ -178,14 +178,15 @@ static void send_codec_filler(void) {
 }
 
 typedef enum {
-  TRACK_FINISHED,  // end of file, codec error, or the track could not be opened
+  TRACK_EOF,       // the file was played to its end — the caller may advance to the next track
+  TRACK_FINISHED,  // aborted: codec/SD error, SD removed, or the track could not be opened
   TRACK_CHANGED,   // a command selected another track — start it right away
 } track_result_t;
 
 // Streams the track at player_state's current index until it ends or a
 // command switches the track. Sets the state to PLAYING on entry (so a
-// track change also clears a pause); the caller sets STOPPED on
-// TRACK_FINISHED.
+// track change also clears a pause); the caller sets STOPPED when there is
+// nothing more to play (TRACK_FINISHED, or TRACK_EOF on the last track).
 static track_result_t stream_current_track(void) {
   char path[SD_MAX_NAME + PATH_EXTRA_CHARS];
   if (get_current_track_path(path, sizeof(path)) != ESP_OK) {
@@ -225,7 +226,7 @@ static track_result_t stream_current_track(void) {
   int chunks_since_status = 0;
 #endif
   int total_chunks_logged = 0;
-  track_result_t result = TRACK_FINISHED;
+  track_result_t result = TRACK_FINISHED;  // default for every abort path
   bool reached_eof = false;
   bool read_error = false;  // the loop ended on an SD read error, not a real EOF
   bool sd_removed = false;  // the loop ended because the card was pulled
@@ -369,6 +370,9 @@ static track_result_t stream_current_track(void) {
     if (reached_eof && info.duration_sec > 0) {
       player_state_set_progress(info.duration_sec, info.duration_sec);
     }
+    if (reached_eof) {
+      result = TRACK_EOF;
+    }
 
     ESP_LOGI(TAG, "%s", result == TRACK_CHANGED ? "Track changed, closing file" : "End of file");
   }
@@ -385,8 +389,17 @@ static void audio_task(void* arg) {
   // Next/Prev/Select/Play can start another track.
   while (1) {
     if (start_track) {
-      if (stream_current_track() == TRACK_CHANGED) {
+      track_result_t result = stream_current_track();
+      if (result == TRACK_CHANGED) {
         continue;  // start_track stays true: open the newly selected track
+      }
+      // Auto-advance only after a real end of file, never after an error.
+      if (result == TRACK_EOF) {
+        if (player_state_next_track()) {
+          ESP_LOGI(TAG, "Track ended, advancing to the next one");
+          continue;  // start_track stays true: open the next track
+        }
+        ESP_LOGI(TAG, "Last track ended");
       }
       player_state_set_playback(PLAYBACK_STOPPED);
       ESP_LOGI(TAG, "Playback stopped, waiting for commands");
