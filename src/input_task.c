@@ -32,8 +32,8 @@ typedef struct {
 // cache may be disabled (NVS writes by the BLE stack), so it must not live in
 // flash-mapped .rodata.
 static const DRAM_ATTR button_cfg_t s_buttons[] = {
-    {.pin = GPIO_NUM_1, .cmd = CMD_PLAY_PAUSE, .repeat = false},
-    {.pin = GPIO_NUM_2, .cmd = CMD_NEXT, .repeat = false},
+    {.pin = GPIO_NUM_2, .cmd = CMD_PLAY_PAUSE, .repeat = false},
+    {.pin = GPIO_NUM_1, .cmd = CMD_NEXT, .repeat = false},
     {.pin = GPIO_NUM_42, .cmd = CMD_PREV, .repeat = false},
     {.pin = GPIO_NUM_21, .cmd = CMD_VOLUME_UP, .repeat = true},
     {.pin = GPIO_NUM_47, .cmd = CMD_VOLUME_DOWN, .repeat = true},

@@ -1,5 +1,6 @@
 #include "player_state.h"
 
+#include "audio_task.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -136,6 +137,13 @@ bool player_state_prev_track(void) {
 }
 
 void player_state_set_track_count(int count) {
+#if CONFIG_AUDIO_DEBUG_MODE
+  // Only CONFIG_AUDIO_DEBUG_FILENAME is ever played, so expose a single track:
+  // Next/Prev/Select then have nothing to switch to.
+  if (count > 1) {
+    count = 1;
+  }
+#endif
   xSemaphoreTake(s_state_mutex, portMAX_DELAY);
   s_state.track_count = count;
   if (s_state.track_index >= count) {

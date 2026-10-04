@@ -1,0 +1,69 @@
+menu "MP3 player: audio debug"
+
+    config AUDIO_DEBUG_MODE
+        bool "Single-file debug mode"
+        default n
+        help
+            audio_task always plays AUDIO_DEBUG_FILENAME from the SD card and
+            ignores the track list. player_state exposes a single track in
+            this mode (Next/Prev/Select have nothing to switch to); the
+            display shows the played file name on the highlighted row and a
+            'D' marker in the header.
+
+    config AUDIO_DEBUG_FILENAME
+        string "File played in debug mode"
+        default "demo_audio.mp3"
+        depends on AUDIO_DEBUG_MODE
+        help
+            File name at the SD card mount point, e.g. demo_audio.mp3.
+
+    config AUDIO_DEBUG_DUMP_CHUNKS
+        int "Hex-dump the first N chunks read from the SD card"
+        range 0 64
+        default 5
+        help
+            Confirms fread returns real file bytes (MP3 sync word 0xFF 0xFB
+            at the start) before they are sent to the codec. 0 disables.
+
+    config AUDIO_DEBUG_DECODE_STATUS_PERIOD_CHUNKS
+        int "Log VS1053 decode status every N chunks"
+        range 0 2000
+        default 200
+        help
+            Logs SCI_STATUS/HDAT0/HDAT1 every N 32-byte chunks sent to the
+            codec (200 is about 1.5 s of audio at 128 kbps). 0 disables.
+
+    config AUDIO_DEBUG_MP3_INFO_LOG
+        bool "Log first MP3 frame header details"
+        default n
+        help
+            Logs bitrate, sample rate, channel mode and Xing duration found
+            by mp3_get_info() for every track that starts playing.
+
+    choice AUDIO_DEBUG_VS1053_LOG_LEVEL
+        prompt "VS1053 driver log level"
+        default AUDIO_DEBUG_VS1053_LOG_WARN
+
+        config AUDIO_DEBUG_VS1053_LOG_WARN
+            bool "Warning"
+        config AUDIO_DEBUG_VS1053_LOG_INFO
+            bool "Info"
+        config AUDIO_DEBUG_VS1053_LOG_DEBUG
+            bool "Debug"
+    endchoice
+
+    choice AUDIO_DEBUG_SPI_MASTER_LOG_LEVEL
+        prompt "spi_master log level"
+        default AUDIO_DEBUG_SPI_MASTER_LOG_INFO
+        help
+            Debug level prints a "deviceN release bus" line per transfer.
+
+        config AUDIO_DEBUG_SPI_MASTER_LOG_WARN
+            bool "Warning"
+        config AUDIO_DEBUG_SPI_MASTER_LOG_INFO
+            bool "Info"
+        config AUDIO_DEBUG_SPI_MASTER_LOG_DEBUG
+            bool "Debug"
+    endchoice
+
+endmenu

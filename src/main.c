@@ -2,6 +2,7 @@
 #include "ble_task.h"
 #include "display_task.h"
 #include "esp_log.h"
+#include "esp_log_level.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -17,9 +18,27 @@ static const char* TAG = "main";
 #define STARTUP_DELAY_MS 2000  // lets the serial monitor attach before the first logs
 #define CMD_QUEUE_LENGTH 10
 
+#if CONFIG_AUDIO_DEBUG_VS1053_LOG_DEBUG
+#define VS1053_LOG_LEVEL ESP_LOG_DEBUG
+#elif CONFIG_AUDIO_DEBUG_VS1053_LOG_INFO
+#define VS1053_LOG_LEVEL ESP_LOG_INFO
+#else
+#define VS1053_LOG_LEVEL ESP_LOG_WARN
+#endif
+
+#if CONFIG_AUDIO_DEBUG_SPI_MASTER_LOG_DEBUG
+#define SPI_MASTER_LOG_LEVEL ESP_LOG_DEBUG
+#elif CONFIG_AUDIO_DEBUG_SPI_MASTER_LOG_WARN
+#define SPI_MASTER_LOG_LEVEL ESP_LOG_WARN
+#else
+#define SPI_MASTER_LOG_LEVEL ESP_LOG_INFO  // drops "deviceN release bus" debug spam
+#endif
+
 void app_main(void) {
   vTaskDelay(pdMS_TO_TICKS(STARTUP_DELAY_MS));
   esp_log_level_set("ssd1306", ESP_LOG_WARN);
+  esp_log_level_set("spi_master", SPI_MASTER_LOG_LEVEL);
+  esp_log_level_set("VS1053", VS1053_LOG_LEVEL);
 
   ESP_LOGI(TAG, "MP3 player starting up");
 

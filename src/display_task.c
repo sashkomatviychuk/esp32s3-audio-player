@@ -65,9 +65,9 @@ esp_err_t display_task_init(void) {
     return ret;
   }
 
-#if AUDIO_DEBUG_MODE
+#if CONFIG_AUDIO_DEBUG_MODE
   ESP_LOGW(TAG, "AUDIO_DEBUG_MODE enabled: highlighted row shows %s, 'D' marker in header",
-           AUDIO_DEBUG_FILENAME);
+           CONFIG_AUDIO_DEBUG_FILENAME);
 #endif
 
   BaseType_t created = xTaskCreate(display_task, "display_task", DISPLAY_TASK_STACK_SIZE, NULL,

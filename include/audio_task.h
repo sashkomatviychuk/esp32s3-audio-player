@@ -4,26 +4,12 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
+#include "sdkconfig.h"
 
-// -----------------------------------------------------------------
-// Switch between "single-file debug" and "real project logic".
-//
-// AUDIO_DEBUG_MODE 1 — audio_task always plays AUDIO_DEBUG_FILENAME,
-//   ignoring the track list. Set AUDIO_DEBUG_FILENAME to "demo_audio.mp3"
-//   or "demo_audio_2.mp3", rebuild — and the chosen file plays.
-//
-//   NOTE: Next/Prev/Select still update player_state's track_index in
-//   this mode (and restart the stream), but the file played stays
-//   AUDIO_DEBUG_FILENAME. The display shows the played file name on the
-//   highlighted row and a 'D' marker in the header.
-//
-// AUDIO_DEBUG_MODE 0 — the track at player_state's track_index is played
-//   from the SD module's track list.
-//
-// Lives in the header so audio_task and the display share one switch point.
-// -----------------------------------------------------------------
-#define AUDIO_DEBUG_MODE 1
-#define AUDIO_DEBUG_FILENAME "demo_audio.mp3"
+// Audio debug settings (single-file debug mode, diagnostic logging) live in
+// Kconfig: see src/Kconfig.projbuild, menu "MP3 player: audio debug"
+// (CONFIG_AUDIO_DEBUG_*). The header only pulls in sdkconfig.h so audio_task,
+// player_state and the display share one switch point.
 
 /**
  * @brief Initializes the audio module: stores the passed-in handles

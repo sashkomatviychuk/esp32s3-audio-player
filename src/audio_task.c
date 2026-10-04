@@ -21,13 +21,12 @@ static const char* TAG = "audio_task";
 #define AUDIO_TASK_PRIORITY 5
 #define PROGRESS_UPDATE_PERIOD_US 500000  // how often elapsed time is published
 #define MAX_CONSECUTIVE_CODEC_ERRORS 10   // stop playback if VS1053 stays unresponsive
-#define VOLUME_STEP 10                    // percent per CMD_VOLUME_UP / CMD_VOLUME_DOWN
+#define SD_POLL_PERIOD_MS 200             // how often idle/paused states check the SD card
+#define VOLUME_STEP 10                   // percent per CMD_VOLUME_UP / CMD_VOLUME_DOWN
 #define CODEC_FILLER_BYTES 10             // zero bytes sent before the first MP3 data
 #define PATH_EXTRA_CHARS 16               // room for "<mount point>/" around a track name
 #define BITS_PER_BYTE 8
-#define DEBUG_DUMP_CHUNKS 5                   // first chunks hex-dumped after reading from the SD
 #define YIELD_EVERY_N_CHUNKS 32               // taskYIELD() cadence, keeps the watchdog fed
-#define DECODE_STATUS_LOG_EVERY_N_CHUNKS 200  // ~every 1.5s of audio at 128kbps
 
 // 2048 reintroduced the SD CRC failures sd-card-issues.md already fixed
 // once (sdspi_host: data CRC failed, mid-stream): a longer continuous SPI
@@ -36,7 +35,7 @@ static const char* TAG = "audio_task";
 // overhead that came with per-32-byte reads, without the long transaction.
 #define READ_BUF_SIZE 512  // read in large blocks, feed VS1053 in 32-byte SDI chunks from it
 
-// AUDIO_DEBUG_MODE / AUDIO_DEBUG_FILENAME are defined in audio_task.h
+// CONFIG_AUDIO_DEBUG_* options come from src/Kconfig.projbuild
 
 // -----------------------------------------------------------------
 // Module-private state (NOT extern, accessible only within this file).
@@ -57,12 +56,12 @@ static esp_err_t send_to_codec(const uint8_t* data, size_t len) {
 
 // -----------------------------------------------------------------
 // Returns the path of the track to play next. The only place that
-// knows about AUDIO_DEBUG_MODE — audio_task itself doesn't see this
+// knows about CONFIG_AUDIO_DEBUG_MODE — audio_task itself doesn't see this
 // detail.
 // -----------------------------------------------------------------
 static esp_err_t get_current_track_path(char* buf, size_t buf_size) {
-#if AUDIO_DEBUG_MODE
-  snprintf(buf, buf_size, "%s/%s", sd_card_get_mount_point(), AUDIO_DEBUG_FILENAME);
+#if CONFIG_AUDIO_DEBUG_MODE
+  snprintf(buf, buf_size, "%s/%s", sd_card_get_mount_point(), CONFIG_AUDIO_DEBUG_FILENAME);
   return ESP_OK;
 #else
   // Track chosen via player_state (set from SCREEN_LIST -> SCREEN_PLAYER,
@@ -71,6 +70,39 @@ static esp_err_t get_current_track_path(char* buf, size_t buf_size) {
   player_state_get(&state);
   return sd_card_get_track_path(state.track_index, buf, buf_size);
 #endif
+}
+
+static bool sd_is_present(void) {
+  player_state_t state;
+  player_state_get(&state);
+  return state.sd_present;
+}
+
+// Reads the track length and bitrate for the display. Reads the file head, so
+// it needs spi_mutex (the SD card shares the bus with the VS1053).
+static void read_track_info(const char* path, FILE* f, mp3_info_t* info) {
+  struct stat st;
+  if (stat(path, &st) == 0 && xSemaphoreTake(s_spi_mutex, portMAX_DELAY) == pdTRUE) {
+    mp3_get_info(f, (size_t)st.st_size, info);
+    xSemaphoreGive(s_spi_mutex);
+  }
+}
+
+// Publishes the duration of the current track without starting playback.
+static void load_track_duration(void) {
+  char path[SD_MAX_NAME + PATH_EXTRA_CHARS];
+  if (get_current_track_path(path, sizeof(path)) != ESP_OK) {
+    return;
+  }
+  FILE* f = fopen(path, "rb");
+  if (f == NULL) {
+    ESP_LOGW(TAG, "Failed to open %s to read its duration", path);
+    return;
+  }
+  mp3_info_t info = {0};
+  read_track_info(path, f, &info);
+  fclose(f);
+  player_state_set_progress(0, info.duration_sec);
 }
 
 // Returns true if the command changed the current track (the caller must
@@ -159,14 +191,8 @@ static track_result_t stream_current_track(void) {
 
   ESP_LOGI(TAG, "Streaming %s", path);
 
-  // Track length and bitrate for the display. Reads the file head, so it
-  // needs spi_mutex (the SD card shares the bus with the VS1053).
   mp3_info_t info = {0};
-  struct stat st;
-  if (stat(path, &st) == 0 && xSemaphoreTake(s_spi_mutex, portMAX_DELAY) == pdTRUE) {
-    mp3_get_info(f, (size_t)st.st_size, &info);
-    xSemaphoreGive(s_spi_mutex);
-  }
+  read_track_info(path, f, &info);
   // Elapsed time is derived from the bytes handed to the codec (the VS1053
   // decode-time register is not usable while the decoder does not lock on).
   // DREQ paces the transfer, so this follows real playback; pause is
@@ -184,21 +210,29 @@ static track_result_t stream_current_track(void) {
   size_t read_buf_pos = 0;
   player_cmd_t cmd;
   int consecutive_codec_errors = 0;
-  int chunks_sent = 0;
+  unsigned chunks_sent = 0;  // yield cadence; never reset
+#if CONFIG_AUDIO_DEBUG_DECODE_STATUS_PERIOD_CHUNKS > 0
+  int chunks_since_status = 0;
+#endif
   int total_chunks_logged = 0;
   track_result_t result = TRACK_FINISHED;
   bool reached_eof = false;
   bool read_error = false;  // the loop ended on an SD read error, not a real EOF
+  bool sd_removed = false;  // the loop ended because the card was pulled
   int read_errno = 0;
 
   while (1) {
-    // --- While paused: block on the Queue with no timeout (0% CPU) ---
+    // --- While paused: block on the Queue (near 0% CPU). The timeout only
+    //     exists to notice the SD card being pulled — the file is dead then ---
     if (player_state_get_playback() == PLAYBACK_PAUSED) {
-      if (xQueueReceive(s_cmd_queue, &cmd, portMAX_DELAY) == pdTRUE) {
+      if (xQueueReceive(s_cmd_queue, &cmd, pdMS_TO_TICKS(SD_POLL_PERIOD_MS)) == pdTRUE) {
         if (handle_cmd(&cmd)) {
           result = TRACK_CHANGED;
           break;
         }
+      } else if (!sd_is_present()) {
+        sd_removed = true;
+        break;
       }
       continue;  // re-check the state before reading the file
     }
@@ -220,6 +254,10 @@ static track_result_t stream_current_track(void) {
     //     means the mutex take/give and queue-check overhead around each
     //     fread only happens once per 512 bytes instead of once per 32. ---
     if (read_buf_pos >= read_buf_len) {
+      if (!sd_is_present()) {
+        sd_removed = true;
+        break;
+      }
       if (xSemaphoreTake(s_spi_mutex, portMAX_DELAY) == pdTRUE) {
         read_buf_len = fread(read_buf, 1, READ_BUF_SIZE, f);
         xSemaphoreGive(s_spi_mutex);
@@ -251,7 +289,7 @@ static track_result_t stream_current_track(void) {
     //     to confirm fread is actually returning real file bytes (MP3
     //     sync word 0xFF 0xFB expected at the very start) before they
     //     get sent to the codec ---
-    if (total_chunks_logged < DEBUG_DUMP_CHUNKS) {
+    if (total_chunks_logged < CONFIG_AUDIO_DEBUG_DUMP_CHUNKS) {
       char hex[(CHUNK_SIZE * 3) + 1];
       for (size_t i = 0; i < bytes_to_send; i++) {
         snprintf(hex + (i * 3), 4, "%02X ", chunk[i]);
@@ -292,10 +330,13 @@ static track_result_t stream_current_track(void) {
 
     // --- Diagnostic: confirm the decoder is actually locking onto MP3
     //     frames in the data we're sending, not just accepting bytes ---
-    if (++chunks_sent >= DECODE_STATUS_LOG_EVERY_N_CHUNKS) {
-      chunks_sent = 0;
+    chunks_sent++;
+#if CONFIG_AUDIO_DEBUG_DECODE_STATUS_PERIOD_CHUNKS > 0
+    if (++chunks_since_status >= CONFIG_AUDIO_DEBUG_DECODE_STATUS_PERIOD_CHUNKS) {
+      chunks_since_status = 0;
       vs1053_log_decode_status();
     }
+#endif
 
     // CONFIG_FREERTOS_HZ=100 means vTaskDelay(1) blocks for a whole 10ms
     // tick — calling it after every 32-byte chunk capped throughput at
@@ -308,7 +349,9 @@ static track_result_t stream_current_track(void) {
     }
   }
 
-  if (read_error) {
+  if (sd_removed) {
+    ESP_LOGW(TAG, "SD card removed, stopping playback");
+  } else if (read_error) {
     ESP_LOGE(TAG, "SD read error (errno %d), stopping playback", read_errno);
   } else {
     // The periodic update can lag up to PROGRESS_UPDATE_PERIOD_US and the byte
@@ -326,6 +369,7 @@ static track_result_t stream_current_track(void) {
 static void audio_task(void* arg) {
   player_cmd_t cmd;
   bool start_track = true;  // autoplay the current track on startup
+  bool duration_probed = false;
 
   // The task never exits: after a track ends it waits for commands so
   // Next/Prev/Select/Play can start another track.
@@ -340,11 +384,23 @@ static void audio_task(void* arg) {
       continue;
     }
 
-    // --- STOPPED: block on the Queue with no timeout (0% CPU) ---
-    if (xQueueReceive(s_cmd_queue, &cmd, portMAX_DELAY) == pdTRUE) {
-      if (handle_cmd(&cmd) || cmd.type == CMD_PLAY_PAUSE) {
+    // --- STOPPED: block on the Queue (near 0% CPU). The timeout lets us show
+    //     the track length once the SD card is back, without starting playback ---
+    if (xQueueReceive(s_cmd_queue, &cmd, pdMS_TO_TICKS(SD_POLL_PERIOD_MS)) == pdTRUE) {
+      bool track_changed = handle_cmd(&cmd);
+      if (sd_is_present() && (track_changed || cmd.type == CMD_PLAY_PAUSE)) {
         start_track = true;  // track changed, or Play pressed — (re)start current track
       }
+      continue;
+    }
+
+    player_state_t state;
+    player_state_get(&state);
+    if (!state.sd_present) {
+      duration_probed = false;  // probe again after the next insertion
+    } else if (!duration_probed && state.track_count > 0 && state.duration_sec == 0) {
+      duration_probed = true;  // once per insertion, an unreadable file must not be retried
+      load_track_duration();
     }
   }
 }
@@ -358,9 +414,9 @@ esp_err_t audio_task_init(QueueHandle_t cmd_queue, SemaphoreHandle_t spi_mutex) 
   s_cmd_queue = cmd_queue;
   s_spi_mutex = spi_mutex;
 
-#if AUDIO_DEBUG_MODE
-  ESP_LOGW(TAG, "AUDIO_DEBUG_MODE enabled: always playing %s, track list ignored",
-           AUDIO_DEBUG_FILENAME);
+#if CONFIG_AUDIO_DEBUG_MODE
+  ESP_LOGW(TAG, "CONFIG_AUDIO_DEBUG_MODE enabled: always playing %s, track list ignored",
+           CONFIG_AUDIO_DEBUG_FILENAME);
 #endif
 
   BaseType_t ret =

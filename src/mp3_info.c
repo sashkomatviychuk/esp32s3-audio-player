@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "sdkconfig.h"
 
 static const char* TAG = "mp3_info";
 
@@ -181,6 +182,17 @@ void mp3_get_info(FILE* f, size_t file_size, mp3_info_t* out) {
       const int16_t* table = header.version == MPEG_VERSION_1 ? BITRATE_MPEG1_L3 : BITRATE_MPEG2_L3;
       bitrate = (uint32_t)table[header.bitrateIdx] * BITS_PER_KBIT;
       xing_duration_sec = read_xing_duration(buf, n, frame_pos, &header);
+#if CONFIG_AUDIO_DEBUG_MP3_INFO_LOG
+      ESP_LOGI(TAG,
+               "First frame: file %u B, audio_start %u, frame_pos %u, MPEG ver %d, bitrate idx %d "
+               "(%d kbps), sample rate idx %d, channel mode %d, Xing %us",
+               (unsigned)file_size, (unsigned)audio_start, (unsigned)frame_pos, header.version,
+               header.bitrateIdx, (int)table[header.bitrateIdx], header.sampleRateIdx,
+               header.channelMode, (unsigned)xing_duration_sec);
+#endif
+    } else {
+      ESP_LOGW(TAG, "No usable MPEG frame in %u bytes after audio_start %u", (unsigned)n,
+               (unsigned)audio_start);
     }
   }
   // The caller streams the file from the start next, so a failed seek is fatal for it too

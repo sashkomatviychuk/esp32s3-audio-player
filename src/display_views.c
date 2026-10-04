@@ -94,7 +94,7 @@ static void render_header(const player_state_t* state) {
   }
   display_draw_bitmap(HEADER_ICON_X, HEADER_Y, icon, ICON_SIZE, ICON_SIZE);
 
-#if AUDIO_DEBUG_MODE
+#if CONFIG_AUDIO_DEBUG_MODE
   display_draw_text(HEADER_DEBUG_X, HEADER_Y, "D", 1);
 #endif
 
@@ -127,8 +127,8 @@ static void render_list(const player_state_t* state) {
     int y = LIST_Y + (row * LIST_ROW_H);
     const char* name = sd_card_get_track_name(index);
     if (index == state->track_index) {
-#if AUDIO_DEBUG_MODE
-      name = AUDIO_DEBUG_FILENAME;  // show what is really playing
+#if CONFIG_AUDIO_DEBUG_MODE
+      name = CONFIG_AUDIO_DEBUG_FILENAME;  // show what is really playing
 #endif
       display_draw_rounded_frame(0, y, DISPLAY_WIDTH, LIST_ROW_H);
     }
