@@ -13,7 +13,7 @@
 
 /**
  * @brief Initializes the audio module: stores the passed-in handles
- *        and creates vAudioTask.
+ *        and creates audio_task.
  *
  * @param cmd_queue   Shared command Queue (created in main.c,
  *                    written to by input_task and ble_task)
