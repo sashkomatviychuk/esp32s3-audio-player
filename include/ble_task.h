@@ -13,7 +13,8 @@
  * bonding or encryption is used: any central may connect and write.
  *
  * A write must carry exactly one ASCII byte:
- *   'P' play/pause, 'N' next, 'B' previous, '+' volume up, '-' volume down.
+ *   'P' play/pause, 'N' next, 'B' previous, '+' volume up, '-' volume down,
+ *   'M' toggle mute.
  * Each valid byte is turned into a player_cmd_t and sent to cmd_queue with a
  * zero timeout (a full queue drops the command and logs a warning). Anything
  * else is rejected with an ATT error (visible only for WRITE with response).

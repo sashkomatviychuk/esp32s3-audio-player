@@ -53,6 +53,9 @@ static bool byte_to_cmd(uint8_t byte, cmd_type_t* out) {
     case '-':
       *out = CMD_VOLUME_DOWN;
       return true;
+    case 'M':
+      *out = CMD_TOGGLE_MUTE;
+      return true;
     default:
       return false;
   }

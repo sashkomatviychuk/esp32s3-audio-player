@@ -7,6 +7,7 @@ typedef enum {
   CMD_VOLUME_UP,
   CMD_VOLUME_DOWN,
   CMD_SELECT_TRACK,  // uses player_cmd_t.index
+  CMD_TOGGLE_MUTE,
 } cmd_type_t;
 
 typedef struct {

@@ -71,12 +71,23 @@ uint8_t player_state_change_volume(int delta) {
   }
   uint8_t old_volume = s_state.volume;
   s_state.volume = (uint8_t)volume;
+  s_state.muted = false;
   xSemaphoreGive(s_state_mutex);
 
   if (volume == old_volume) {
     ESP_LOGW(TAG, "Volume already at limit (%d)", volume);
   }
   return (uint8_t)volume;
+}
+
+bool player_state_toggle_mute(void) {
+  xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+  s_state.muted = !s_state.muted;
+  bool muted = s_state.muted;
+  xSemaphoreGive(s_state_mutex);
+
+  ESP_LOGI(TAG, "Muted -> %d", muted);
+  return muted;
 }
 
 esp_err_t player_state_select_track(int index) {

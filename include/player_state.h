@@ -10,7 +10,8 @@ typedef enum { PLAYBACK_STOPPED = 0, PLAYBACK_PLAYING, PLAYBACK_PAUSED } playbac
 /** Atomic snapshot of the whole player state (for display / BLE tasks). */
 typedef struct {
   playback_state_t playback;
-  uint8_t volume;   // 0..100
+  uint8_t volume;   // 0..100, kept while muted
+  bool muted;       // sound is off; volume above is what unmute restores
   int track_index;  // index into the SD track list
   int track_count;  // number of tracks found on the SD card
   uint32_t elapsed_sec;   // playback position of the current track
@@ -47,15 +48,29 @@ uint8_t player_state_get_volume(void);
 void player_state_set_playback(playback_state_t playback);
 
 /**
- * @brief Changes the volume by @p delta, clamped to 0..100.
+ * @brief Changes the volume by @p delta, clamped to 0..100. Also clears the
+ *        muted flag: turning the volume while muted unmutes.
  *
  * Only updates the stored value — it does NOT touch the codec. The caller
  * is responsible for applying the returned value with vs1053_set_volume()
- * (which takes spi_mutex itself), outside of any state lock.
+ * (which takes spi_mutex itself), outside of any state lock. Note that the
+ * result can equal the old volume (already at a limit) while muted has
+ * changed, so check the muted flag before skipping the codec update.
  *
  * @return The new volume; equal to the old one if already at a limit
  */
 uint8_t player_state_change_volume(int delta);
+
+/**
+ * @brief Flips the muted flag; the volume value is left untouched, so
+ *        unmuting restores the previous level.
+ *
+ * Only updates the stored flag — the caller applies it to the codec (see
+ * player_state_change_volume). Locking: internal state mutex only.
+ *
+ * @return The new muted state
+ */
+bool player_state_toggle_mute(void);
 
 /**
  * @brief Selects the track at @p index.

@@ -14,7 +14,7 @@
  * cmd_queue. The step size per command is audio_task's business.
  *
  * A and B use the internal pull-ups (pins are listed in encoder.c). The push
- * switch (SW) is wired but not handled yet.
+ * switch (SW, mute) is not handled here — it is a regular button in input_task.
  *
  * Like input_task, the module never touches player_state or the SPI mutex —
  * it only writes commands to the queue, with a zero timeout (a full queue

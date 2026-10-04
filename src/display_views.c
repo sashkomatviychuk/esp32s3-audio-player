@@ -34,6 +34,7 @@ static const char* TAG = "display_views";
 static const uint8_t ICON_PLAY[8] = {0x80, 0xC0, 0xE0, 0xF0, 0xF0, 0xE0, 0xC0, 0x80};
 static const uint8_t ICON_PAUSE[8] = {0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66};
 static const uint8_t ICON_STOP[8] = {0x00, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x00};
+static const uint8_t ICON_MUTE[8] = {0x10, 0x30, 0xF5, 0xF2, 0xF5, 0x30, 0x10, 0x00};  // speaker + x
 
 // 16x16 warning triangle with "!", same format (2 bytes per row)
 static const uint8_t ICON_WARNING[32] = {
@@ -80,7 +81,8 @@ static void format_time(char* out, size_t out_size, const player_state_t* state)
 // -----------------------------------------------------------------
 // Player view parts
 // -----------------------------------------------------------------
-// First row: time, play/pause/stop icon, debug marker, volume bar, separator.
+// First row: time, play/pause/stop icon, debug marker, volume bar (mute icon
+// while muted), separator.
 static void render_header(const player_state_t* state) {
   char time[TIME_BUF_SIZE];
   format_time(time, sizeof(time), state);
@@ -98,7 +100,12 @@ static void render_header(const player_state_t* state) {
   display_draw_text(HEADER_DEBUG_X, HEADER_Y, "D", 1);
 #endif
 
-  display_draw_bar(HEADER_BAR_X, HEADER_Y, HEADER_BAR_W, HEADER_BAR_H, state->volume);
+  if (state->muted) {
+    // An icon instead of the bar: an empty bar would look like volume 0.
+    display_draw_bitmap(HEADER_BAR_X, HEADER_Y, ICON_MUTE, ICON_SIZE, ICON_SIZE);
+  } else {
+    display_draw_bar(HEADER_BAR_X, HEADER_Y, HEADER_BAR_W, HEADER_BAR_H, state->volume);
+  }
   display_draw_hline(SEPARATOR_Y);
 }
 

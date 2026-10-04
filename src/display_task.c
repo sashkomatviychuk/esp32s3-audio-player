@@ -16,6 +16,7 @@ static const char* TAG = "display_task";
 
 static bool state_changed(const player_state_t* curr_state, const player_state_t* last_state) {
   return curr_state->playback != last_state->playback || curr_state->volume != last_state->volume ||
+         curr_state->muted != last_state->muted ||
          curr_state->track_index != last_state->track_index ||
          curr_state->track_count != last_state->track_count ||
          curr_state->elapsed_sec != last_state->elapsed_sec ||

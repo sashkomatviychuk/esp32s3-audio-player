@@ -135,15 +135,25 @@ static bool handle_cmd(const player_cmd_t* cmd) {
 
     case CMD_VOLUME_UP:
     case CMD_VOLUME_DOWN: {
-      uint8_t old_volume = player_state_get_volume();
+      player_state_t before;
+      player_state_get(&before);
+      // A volume change also unmutes (player_state clears the flag).
       uint8_t volume =
           player_state_change_volume(cmd->type == CMD_VOLUME_UP ? VOLUME_STEP : -VOLUME_STEP);
-      if (volume == old_volume) {
+      if (volume == before.volume && !before.muted) {
         break;  // already at a limit (player_state logged the warning)
       }
       // takes spi_mutex INTERNALLY, we do NOT hold it here (nor the state lock)
       vs1053_set_volume(volume);
       ESP_LOGI(TAG, "Volume %s -> %d", cmd->type == CMD_VOLUME_UP ? "up" : "down", volume);
+      break;
+    }
+
+    case CMD_TOGGLE_MUTE: {
+      bool muted = player_state_toggle_mute();
+      // The stored volume is kept, so unmuting restores the previous level.
+      vs1053_set_volume(muted ? 0 : player_state_get_volume());
+      ESP_LOGI(TAG, "%s", muted ? "Muted" : "Unmuted");
       break;
     }
 
