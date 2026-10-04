@@ -17,3 +17,6 @@ CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
 
 # Audio debug (see src/Kconfig.projbuild)
 CONFIG_AUDIO_DEBUG_MODE=n
+
+# EC11 encoder: PCNT interrupt must work while NVS/BLE writes flash
+CONFIG_PCNT_ISR_IRAM_SAFE=y

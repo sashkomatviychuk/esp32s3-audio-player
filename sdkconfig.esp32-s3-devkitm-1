@@ -1852,8 +1852,7 @@ CONFIG_MCPWM_OBJ_CACHE_SAFE=y
 #
 # default:
 # CONFIG_PCNT_CTRL_FUNC_IN_IRAM is not set
-# default:
-# CONFIG_PCNT_ISR_IRAM_SAFE is not set
+CONFIG_PCNT_ISR_IRAM_SAFE=y
 # default:
 # CONFIG_PCNT_ENABLE_DEBUG_LOG is not set
 # end of ESP-Driver:PCNT Configurations

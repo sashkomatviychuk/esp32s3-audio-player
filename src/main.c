@@ -1,6 +1,7 @@
 #include "audio_task.h"
 #include "ble_task.h"
 #include "display_task.h"
+#include "encoder.h"
 #include "esp_log.h"
 #include "esp_log_level.h"
 #include "freertos/FreeRTOS.h"
@@ -96,6 +97,11 @@ void app_main(void) {
   // Buttons only send commands to cmd_queue; the player works without them.
   if (input_task_init(cmd_queue) != ESP_OK) {
     ESP_LOGE(TAG, "input_task_init failed, continuing without buttons");
+  }
+
+  // The encoder only sends commands to cmd_queue too; the player works without it.
+  if (encoder_init(cmd_queue) != ESP_OK) {
+    ESP_LOGE(TAG, "encoder_init failed, continuing without encoder");
   }
 
   // BLE only sends commands to cmd_queue; the player works without it.

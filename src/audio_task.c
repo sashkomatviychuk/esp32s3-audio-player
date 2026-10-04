@@ -22,7 +22,7 @@ static const char* TAG = "audio_task";
 #define PROGRESS_UPDATE_PERIOD_US 500000  // how often elapsed time is published
 #define MAX_CONSECUTIVE_CODEC_ERRORS 10   // stop playback if VS1053 stays unresponsive
 #define SD_POLL_PERIOD_MS 200             // how often idle/paused states check the SD card
-#define VOLUME_STEP 10                   // percent per CMD_VOLUME_UP / CMD_VOLUME_DOWN
+#define VOLUME_STEP 5                    // percent per CMD_VOLUME_UP / CMD_VOLUME_DOWN
 #define CODEC_FILLER_BYTES 10             // zero bytes sent before the first MP3 data
 #define PATH_EXTRA_CHARS 16               // room for "<mount point>/" around a track name
 #define BITS_PER_BYTE 8

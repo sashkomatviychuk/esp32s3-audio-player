@@ -10,7 +10,8 @@
  * Event-driven, no polling: a GPIO interrupt on every button edge wakes
  * input_task, which starts a one-shot esp_timer for debounce. When the timer
  * fires, the settled level is read and — on a real press — a player_cmd_t is
- * sent to cmd_queue. Volume buttons auto-repeat while held; the others don't.
+ * sent to cmd_queue. Buttons flagged `repeat` in the table auto-repeat while
+ * held (none at the moment; volume is the encoder's job, see encoder.h).
  *
  * Buttons are active-low with the internal pull-up (see the table in
  * input_task.c). The module never touches player_state or the SPI mutex —
