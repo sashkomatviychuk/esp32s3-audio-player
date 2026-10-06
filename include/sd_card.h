@@ -14,7 +14,7 @@
 /**
  * @brief Initializes the SD card's SPI bus (SPI2) and mounts the card (FAT32).
  *
- * The VS1053 uses its own separate bus (SPI3), initialized in vs1053_init().
+ * The (disabled) VS1053 used its own separate bus (SPI3); the PCM5102 uses I2S, no SPI.
  *
  * Locking: takes no mutex — call it before any task that uses the card
  * is created.

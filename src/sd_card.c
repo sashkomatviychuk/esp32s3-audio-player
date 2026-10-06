@@ -21,7 +21,10 @@ static const char* TAG = "sd_card";
 #define PIN_NUM_CS 14
 #define MOUNT_POINT "/sdcard"
 
-#define SD_MAX_FREQ_KHZ 100        // see the speed history in try_mount()
+// 4 MHz (~300+ KB/s) is needed for 44.1 kHz stereo WAV (176 KB/s); 100 kHz only
+// gave ~35 KB/s. If "data CRC failed" shows up mid-stream again, lower this or
+// fix the wiring — see the speed history in try_mount().
+#define SD_MAX_FREQ_KHZ 4000
 #define SD_WAIT_FOR_MISO_MS 100    // "card ready" polling window (driver default is 40)
 #define SD_MAX_OPEN_FILES 5
 #define SD_ALLOCATION_UNIT_SIZE 512  // FAT/SD sector size
@@ -148,14 +151,14 @@ const char* sd_card_get_mount_point(void) {
   return MOUNT_POINT;
 }
 
-static bool has_mp3_extension(const char* name) {
+static bool has_wav_extension(const char* name) {
   size_t len = strlen(name);
   if (len < 4) {
     return false;
   }
   const char* ext = name + len - 4;
-  return ext[0] == '.' && tolower((unsigned char)ext[1]) == 'm' &&
-         tolower((unsigned char)ext[2]) == 'p' && tolower((unsigned char)ext[3]) == '3';
+  return ext[0] == '.' && tolower((unsigned char)ext[1]) == 'w' &&
+         tolower((unsigned char)ext[2]) == 'a' && tolower((unsigned char)ext[3]) == 'v';
 }
 
 esp_err_t sd_card_scan_tracks(SemaphoreHandle_t spi_mutex) {
@@ -179,10 +182,10 @@ esp_err_t sd_card_scan_tracks(SemaphoreHandle_t spi_mutex) {
   int count = 0;
   struct dirent* entry;
   while ((entry = readdir(dir)) != NULL) {
-    // Skip hidden files too: macOS leaves "._name.mp3" AppleDouble stubs next
-    // to the real tracks on cards written from a Mac — they match ".mp3" but
+    // Skip hidden files too: macOS leaves "._name.wav" AppleDouble stubs next
+    // to the real tracks on cards written from a Mac — they match ".wav" but
     // aren't playable audio.
-    if (entry->d_type == DT_DIR || entry->d_name[0] == '.' || !has_mp3_extension(entry->d_name)) {
+    if (entry->d_type == DT_DIR || entry->d_name[0] == '.' || !has_wav_extension(entry->d_name)) {
       continue;
     }
     if (count >= SD_MAX_TRACKS) {
@@ -202,9 +205,9 @@ esp_err_t sd_card_scan_tracks(SemaphoreHandle_t spi_mutex) {
 
   s_track_count = count;
   player_state_set_track_count(count);
-  ESP_LOGI(TAG, "Found %d .mp3 track(s)", count);
+  ESP_LOGI(TAG, "Found %d .wav track(s)", count);
   if (count == 0) {
-    ESP_LOGW(TAG, "No .mp3 files found in %s", MOUNT_POINT);
+    ESP_LOGW(TAG, "No .wav files found in %s", MOUNT_POINT);
   }
   return ESP_OK;
 }

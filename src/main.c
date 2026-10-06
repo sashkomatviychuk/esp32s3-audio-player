@@ -9,23 +9,25 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "input_task.h"
+#include "pcm5102.h"
 #include "player_state.h"
 #include "player_types.h"
 #include "sd_card.h"
-#include "vs1053.h"
+// #include "vs1053.h"  // VS1053 disabled, audio goes through the PCM5102 (I2S)
 
 static const char* TAG = "main";
 
 #define STARTUP_DELAY_MS 2000  // lets the serial monitor attach before the first logs
 #define CMD_QUEUE_LENGTH 10
 
-#if CONFIG_AUDIO_DEBUG_VS1053_LOG_DEBUG
-#define VS1053_LOG_LEVEL ESP_LOG_DEBUG
-#elif CONFIG_AUDIO_DEBUG_VS1053_LOG_INFO
-#define VS1053_LOG_LEVEL ESP_LOG_INFO
-#else
-#define VS1053_LOG_LEVEL ESP_LOG_WARN
-#endif
+// VS1053 disabled: its log level setup is kept for when the driver comes back.
+// #if CONFIG_AUDIO_DEBUG_VS1053_LOG_DEBUG
+// #define VS1053_LOG_LEVEL ESP_LOG_DEBUG
+// #elif CONFIG_AUDIO_DEBUG_VS1053_LOG_INFO
+// #define VS1053_LOG_LEVEL ESP_LOG_INFO
+// #else
+// #define VS1053_LOG_LEVEL ESP_LOG_WARN
+// #endif
 
 #if CONFIG_AUDIO_DEBUG_SPI_MASTER_LOG_DEBUG
 #define SPI_MASTER_LOG_LEVEL ESP_LOG_DEBUG
@@ -39,14 +41,13 @@ void app_main(void) {
   vTaskDelay(pdMS_TO_TICKS(STARTUP_DELAY_MS));
   esp_log_level_set("ssd1306", ESP_LOG_WARN);
   esp_log_level_set("spi_master", SPI_MASTER_LOG_LEVEL);
-  esp_log_level_set("VS1053", VS1053_LOG_LEVEL);
+  // esp_log_level_set("VS1053", VS1053_LOG_LEVEL);
 
-  ESP_LOGI(TAG, "MP3 player starting up");
+  ESP_LOGI(TAG, "WAV player starting up");
 
-  // Keep the VS1053 deselected until vs1053_init() runs — its XCS/XDCS pins
-  // would otherwise float (default GPIO input state). It has its own SPI
-  // bus (SPI3), so this no longer affects the SD card (SPI2).
-  vs1053_deselect_early();
+  // VS1053 disabled: it kept its XCS/XDCS pins deselected until vs1053_init().
+  // GPIO4/5/6 now belong to the PCM5102 (I2S LRCK/DIN/BCK).
+  // vs1053_deselect_early();
 
   if (player_state_init() != ESP_OK) {
     ESP_LOGE(TAG, "player_state_init failed");
@@ -72,11 +73,18 @@ void app_main(void) {
     ESP_LOGW(TAG, "sd_card_init failed (no card?), will keep retrying");
   }
 
-  // VS1053 initializes its own, separate SPI bus (SPI3) inside vs1053_init.
-  if (vs1053_init(spi_mutex) != ESP_OK) {
-    ESP_LOGE(TAG, "vs1053_init failed");
+  // The PCM5102 DAC is driven over I2S0 (LRCK 4, DIN 5, BCK 6); it has no SPI
+  // bus, so it does not take part in spi_mutex.
+  if (pcm5102_init() != ESP_OK) {
+    ESP_LOGE(TAG, "pcm5102_init failed");
     return;
   }
+
+  // VS1053 disabled; it initialized its own, separate SPI bus (SPI3) here.
+  // if (vs1053_init(spi_mutex) != ESP_OK) {
+  //   ESP_LOGE(TAG, "vs1053_init failed");
+  //   return;
+  // }
 
   // Scans the card now (if present) and then watches for insert / removal.
   if (sd_card_monitor_init(spi_mutex) != ESP_OK) {

@@ -52,7 +52,7 @@ void player_state_set_playback(playback_state_t playback);
  *        muted flag: turning the volume while muted unmutes.
  *
  * Only updates the stored value — it does NOT touch the codec. The caller
- * is responsible for applying the returned value with vs1053_set_volume()
+ * is responsible for applying the returned value with pcm5102_set_volume()
  * (which takes spi_mutex itself), outside of any state lock. Note that the
  * result can equal the old volume (already at a limit) while muted has
  * changed, so check the muted flag before skipping the codec update.

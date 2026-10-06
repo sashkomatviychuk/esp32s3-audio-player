@@ -12,7 +12,7 @@ menu "MP3 player: audio debug"
 
     config AUDIO_DEBUG_FILENAME
         string "File played in debug mode"
-        default "demo_audio.mp3"
+        default "demo_audio.wav"
         depends on AUDIO_DEBUG_MODE
         help
             File name at the SD card mount point, e.g. demo_audio.mp3.

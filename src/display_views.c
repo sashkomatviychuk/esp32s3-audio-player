@@ -53,12 +53,15 @@ static const uint8_t ICON_WARNING[32] = {
 // -----------------------------------------------------------------
 // Formatting helpers
 // -----------------------------------------------------------------
-// Copies the file name without its ".mp3" extension into out (NUL-terminated,
-// cut to out_size - 1 characters).
+// Copies the file name without its ".wav"/".mp3" extension into out
+// (NUL-terminated, cut to out_size - 1 characters).
 static void format_track_name(const char* name, char* out, size_t out_size) {
   size_t len = strlen(name);
-  if (len > 4 && strcasecmp(name + len - 4, ".mp3") == 0) {
-    len -= 4;
+  if (len > 4) {
+    const char* ext = name + len - 4;
+    if (strcasecmp(ext, ".wav") == 0 || strcasecmp(ext, ".mp3") == 0) {
+      len -= 4;
+    }
   }
   if (len > out_size - 1) {
     len = out_size - 1;

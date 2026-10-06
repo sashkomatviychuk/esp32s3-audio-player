@@ -8,32 +8,26 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/task.h"
-#include "mp3_info.h"
+#include "pcm5102.h"
 #include "player_state.h"
 #include "player_types.h"
 #include "sd_card.h"
-#include "vs1053.h"
+#include "wav_info.h"
 
 static const char* TAG = "audio_task";
 
-#define CHUNK_SIZE 32  // VS1053: 32-byte chunks over SPI
 #define AUDIO_TASK_STACK_SIZE 4096
 #define AUDIO_TASK_PRIORITY 5
 #define PROGRESS_UPDATE_PERIOD_US 500000  // how often elapsed time is published
-#define MAX_CONSECUTIVE_CODEC_ERRORS 10   // stop playback if VS1053 stays unresponsive
 #define SD_POLL_PERIOD_MS 200             // how often idle/paused states check the SD card
 #define VOLUME_STEP 5                     // percent per CMD_VOLUME_UP / CMD_VOLUME_DOWN
-#define CODEC_FILLER_BYTES 10             // zero bytes sent before the first MP3 data
 #define PATH_EXTRA_CHARS 16               // room for "<mount point>/" around a track name
-#define BITS_PER_BYTE 8
-#define YIELD_EVERY_N_CHUNKS 32  // taskYIELD() cadence, keeps the watchdog fed
 
-// 2048 reintroduced the SD CRC failures sd-card-issues.md already fixed
-// once (sdspi_host: data CRC failed, mid-stream): a longer continuous SPI
-// transaction on this breadboard wiring/100kHz is more likely to glitch.
-// 512 matches the FAT/SD sector size — still batches the mutex/queue-check
-// overhead that came with per-32-byte reads, without the long transaction.
-#define READ_BUF_SIZE 512  // read in large blocks, feed VS1053 in 32-byte SDI chunks from it
+// One SD read = one I2S write. At 44.1 kHz stereo 2048 bytes are ~12 ms of
+// audio, far less than the DMA buffer in pcm5102.c (~87 ms), so a slow SD read
+// does not starve the DAC, and a command waits at most one block. Must be a
+// multiple of 4 (one stereo frame) so a block never ends mid-frame.
+#define READ_BUF_SIZE 2048
 
 // CONFIG_AUDIO_DEBUG_* options come from src/Kconfig.projbuild
 
@@ -43,16 +37,6 @@ static const char* TAG = "audio_task";
 // -----------------------------------------------------------------
 static QueueHandle_t s_cmd_queue = NULL;
 static SemaphoreHandle_t s_spi_mutex = NULL;
-
-// -----------------------------------------------------------------
-// Thin wrapper over the VS1053 driver. Called EXCLUSIVELY while
-// s_spi_mutex is already held (see the audio_task loop below) —
-// vs1053_write_sdi() does not take the mutex itself (to avoid
-// double-locking a non-recursive mutex).
-// -----------------------------------------------------------------
-static esp_err_t send_to_codec(const uint8_t* data, size_t len) {
-  return vs1053_write_sdi(data, (uint8_t)len);
-}
 
 // -----------------------------------------------------------------
 // Returns the path of the track to play next. The only place that
@@ -78,14 +62,17 @@ static bool sd_is_present(void) {
   return state.sd_present;
 }
 
-// Reads the track length and bitrate for the display. Reads the file head, so
-// it needs spi_mutex (the SD card shares the bus with the VS1053).
-static void read_track_info(const char* path, FILE* f, mp3_info_t* info) {
+// Reads the WAV header (length, format) for the display and the stream. Reads
+// the file head, so it needs spi_mutex (the SD card is shared with the scan
+// task). Leaves the file positioned at the first audio byte.
+static esp_err_t read_track_info(const char* path, FILE* f, wav_info_t* info) {
   struct stat st;
-  if (stat(path, &st) == 0 && xSemaphoreTake(s_spi_mutex, portMAX_DELAY) == pdTRUE) {
-    mp3_get_info(f, (size_t)st.st_size, info);
-    xSemaphoreGive(s_spi_mutex);
+  if (stat(path, &st) != 0 || xSemaphoreTake(s_spi_mutex, portMAX_DELAY) != pdTRUE) {
+    return ESP_FAIL;
   }
+  esp_err_t err = wav_get_info(f, (size_t)st.st_size, info);
+  xSemaphoreGive(s_spi_mutex);
+  return err;
 }
 
 // Opens the track at player_state's current index and stores its path in
@@ -110,7 +97,7 @@ static void load_track_duration(void) {
   if (f == NULL) {
     return;
   }
-  mp3_info_t info = {0};
+  wav_info_t info = {0};
   read_track_info(path, f, &info);
   fclose(f);
   player_state_set_progress(0, info.duration_sec);
@@ -154,8 +141,8 @@ static bool handle_cmd(const player_cmd_t* cmd) {
       if (volume == before.volume && !before.muted) {
         break;  // already at a limit (player_state logged the warning)
       }
-      // takes spi_mutex INTERNALLY, we do NOT hold it here (nor the state lock)
-      vs1053_set_volume(volume);
+      pcm5102_set_volume(volume);
+      pcm5102_set_mute(false);
       ESP_LOGI(TAG, "Volume %s -> %d", cmd->type == CMD_VOLUME_UP ? "up" : "down", volume);
       break;
     }
@@ -163,7 +150,7 @@ static bool handle_cmd(const player_cmd_t* cmd) {
     case CMD_TOGGLE_MUTE: {
       bool muted = player_state_toggle_mute();
       // The stored volume is kept, so unmuting restores the previous level.
-      vs1053_set_volume(muted ? 0 : player_state_get_volume());
+      pcm5102_set_mute(muted);
       ESP_LOGI(TAG, "%s", muted ? "Muted" : "Unmuted");
       break;
     }
@@ -175,86 +162,44 @@ static bool handle_cmd(const player_cmd_t* cmd) {
   return false;
 }
 
-// Primes the decoder before the first MP3 data: reference VS1053 libraries
-// (e.g. Adafruit, esp-idf-vs1053) send a handful of zero "filler" bytes over
-// SDI at the start of every stream.
-static void send_codec_filler(void) {
-  uint8_t filler[CODEC_FILLER_BYTES] = {0};
-  if (xSemaphoreTake(s_spi_mutex, portMAX_DELAY) == pdTRUE) {
-    send_to_codec(filler, sizeof(filler));
-    xSemaphoreGive(s_spi_mutex);
-  }
-}
-
 typedef enum {
   TRACK_EOF,       // the file was played to its end — the caller may advance to the next track
-  TRACK_FINISHED,  // aborted: codec/SD error, SD removed, or the track could not be opened
+  TRACK_FINISHED,  // aborted: I2S/SD error, SD removed, or the track could not be played
   TRACK_CHANGED,   // a command selected another track — start it right away
 } track_result_t;
 
 // Why the streaming loop ended; END_NONE means "keep streaming".
 typedef enum {
   END_NONE,
-  END_EOF,          // real end of file
-  END_CHANGED,      // a command switched the track
-  END_SD_REMOVED,   // the card was pulled
-  END_READ_ERROR,   // fread() failed (e.g. an SD CRC error), not a real EOF
-  END_CODEC_ERROR,  // the VS1053 stayed unresponsive
+  END_EOF,         // real end of the audio data
+  END_CHANGED,     // a command switched the track
+  END_SD_REMOVED,  // the card was pulled
+  END_READ_ERROR,  // fread() failed (e.g. an SD CRC error), not a real EOF
+  END_I2S_ERROR,   // the I2S write failed
 } stream_end_t;
 
 // Per-track streaming state, owned by stream_current_track().
 typedef struct {
   FILE* file;
-  mp3_info_t info;
-  // Elapsed time is derived from the bytes handed to the codec (the VS1053
-  // decode-time register is not usable while the decoder does not lock on).
-  // DREQ paces the transfer, so this follows real playback; pause is
-  // accounted for automatically because no bytes are sent while paused.
-  uint64_t bytes_sent;
+  wav_info_t info;
+  // Elapsed time is derived from the audio bytes handed to the DAC. The I2S
+  // write blocks until the DMA has room, so this follows real playback within
+  // the DMA depth; pause is accounted for automatically because no bytes are
+  // sent while paused.
+  uint64_t bytes_played;
+  uint32_t bytes_left;  // audio bytes not yet read from the file
   int64_t last_progress_us;
   size_t buf_len;  // valid bytes in s_read_buf
-  size_t buf_pos;  // next byte of s_read_buf to send
   int read_errno;  // errno of the failed fread (END_READ_ERROR)
-  int consecutive_codec_errors;
-  unsigned chunks_sent;  // yield cadence; never reset
-  int chunks_logged;     // CONFIG_AUDIO_DEBUG_DUMP_CHUNKS counter
-  int chunks_since_status;
 } stream_ctx_t;
 
-static uint8_t s_read_buf[READ_BUF_SIZE];
-
-// --- Diagnostic: dump the first few chunks as read from the SD card, to
-//     confirm fread is actually returning real file bytes (MP3 sync word
-//     0xFF 0xFB expected at the very start) before they get sent to the codec ---
-static void debug_dump_chunk(stream_ctx_t* ctx, const uint8_t* chunk, size_t len) {
-  if (ctx->chunks_logged >= CONFIG_AUDIO_DEBUG_DUMP_CHUNKS) {
-    return;
-  }
-  char hex[(CHUNK_SIZE * 3) + 1];
-  for (size_t i = 0; i < len; i++) {
-    snprintf(hex + (i * 3), 4, "%02X ", chunk[i]);
-  }
-  ESP_LOGI(TAG, "chunk %d (%d bytes): %s", ctx->chunks_logged, (int)len, hex);
-  ctx->chunks_logged++;
-}
-
-// --- Diagnostic: confirm the decoder is actually locking onto MP3 frames in
-//     the data we're sending, not just accepting bytes ---
-static void debug_log_decode_status(stream_ctx_t* ctx) {
-#if CONFIG_AUDIO_DEBUG_DECODE_STATUS_PERIOD_CHUNKS > 0
-  if (++ctx->chunks_since_status >= CONFIG_AUDIO_DEBUG_DECODE_STATUS_PERIOD_CHUNKS) {
-    ctx->chunks_since_status = 0;
-    vs1053_log_decode_status();
-  }
-#else
-  (void)ctx;
-#endif
-}
+static int16_t s_read_buf[READ_BUF_SIZE / sizeof(int16_t)];  // samples as read from the file
+static int16_t s_out_buf[READ_BUF_SIZE];                     // always stereo: 2x a mono block
 
 // Publishes the playback position for the display, at most once per
 // PROGRESS_UPDATE_PERIOD_US.
 static void publish_progress(stream_ctx_t* ctx) {
-  if (ctx->info.bitrate_bps == 0) {
+  if (ctx->info.byte_rate == 0) {
     return;
   }
   int64_t now_us = esp_timer_get_time();
@@ -262,9 +207,7 @@ static void publish_progress(stream_ctx_t* ctx) {
     return;
   }
   ctx->last_progress_us = now_us;
-  uint64_t audio_bytes =
-      ctx->bytes_sent > ctx->info.audio_start ? ctx->bytes_sent - ctx->info.audio_start : 0;
-  player_state_set_progress((uint32_t)(audio_bytes * BITS_PER_BYTE / ctx->info.bitrate_bps),
+  player_state_set_progress((uint32_t)(ctx->bytes_played / ctx->info.byte_rate),
                             ctx->info.duration_sec);
 }
 
@@ -278,28 +221,32 @@ static stream_end_t wait_while_paused(void) {
   return sd_is_present() ? END_NONE : END_SD_REMOVED;
 }
 
-// Refills the read buffer from the SD card. Reading READ_BUF_SIZE at once
-// instead of CHUNK_SIZE (32 bytes) means the mutex take/give and queue-check
-// overhead around each fread only happens once per 512 bytes instead of once
-// per 32. Returns END_NONE when new data is available.
+// Refills the read buffer from the SD card with the next block of audio data,
+// never reading past the end of the "data" chunk. Returns END_NONE when new
+// data is available.
 static stream_end_t refill_buffer(stream_ctx_t* ctx) {
   if (!sd_is_present()) {
     return END_SD_REMOVED;
   }
+  if (ctx->bytes_left == 0) {
+    return END_EOF;
+  }
 
+  size_t to_read = ctx->bytes_left < READ_BUF_SIZE ? ctx->bytes_left : READ_BUF_SIZE;
   size_t len = 0;
   if (xSemaphoreTake(s_spi_mutex, portMAX_DELAY) == pdTRUE) {
-    len = fread(s_read_buf, 1, READ_BUF_SIZE, ctx->file);
+    len = fread(s_read_buf, 1, to_read, ctx->file);
     xSemaphoreGive(s_spi_mutex);
   }
   ctx->buf_len = len;
-  ctx->buf_pos = 0;
   if (len > 0) {
+    ctx->bytes_left -= (uint32_t)len;
     return END_NONE;
   }
 
-  // fread() returns 0 both at a real EOF and on a read error (e.g. an SD CRC
-  // failure) — ferror() tells them apart.
+  // fread() returns 0 both at a real EOF (a file shorter than its header
+  // claims) and on a read error (e.g. an SD CRC failure) — ferror() tells them
+  // apart.
   if (ferror(ctx->file)) {
     ctx->read_errno = errno;
     return END_READ_ERROR;
@@ -307,47 +254,30 @@ static stream_end_t refill_buffer(stream_ctx_t* ctx) {
   return END_EOF;
 }
 
-// Sends the next chunk of the read buffer to the VS1053 (under the mutex for
-// the same SPI bus). Returns END_CODEC_ERROR once the codec has failed
-// MAX_CONSECUTIVE_CODEC_ERRORS times in a row, END_NONE otherwise.
-static stream_end_t send_next_chunk(stream_ctx_t* ctx) {
-  size_t bytes_to_send = ctx->buf_len - ctx->buf_pos;
-  if (bytes_to_send > CHUNK_SIZE) {
-    bytes_to_send = CHUNK_SIZE;
-  }
-  const uint8_t* chunk = s_read_buf + ctx->buf_pos;
+// Converts the block in s_read_buf to stereo (a mono sample is duplicated into
+// both channels, so the I2S format never changes) and sends it to the DAC.
+// Blocks until the DMA accepted all of it, which paces the whole stream.
+static stream_end_t send_buffer(stream_ctx_t* ctx) {
+  size_t bytes_per_frame = ctx->info.channels * sizeof(int16_t);
+  size_t frames = ctx->buf_len / bytes_per_frame;
 
-  debug_dump_chunk(ctx, chunk, bytes_to_send);
-  publish_progress(ctx);
-
-  esp_err_t codec_ret = ESP_FAIL;
-  if (xSemaphoreTake(s_spi_mutex, portMAX_DELAY) == pdTRUE) {
-    codec_ret = send_to_codec(chunk, bytes_to_send);
-    xSemaphoreGive(s_spi_mutex);
-  }
-  ctx->buf_pos += bytes_to_send;
-
-  if (codec_ret != ESP_OK) {
-    if (++ctx->consecutive_codec_errors >= MAX_CONSECUTIVE_CODEC_ERRORS) {
-      return END_CODEC_ERROR;
+  if (ctx->info.channels == 1) {
+    for (size_t i = 0; i < frames; i++) {
+      s_out_buf[2 * i] = s_read_buf[i];
+      s_out_buf[(2 * i) + 1] = s_read_buf[i];
     }
   } else {
-    ctx->consecutive_codec_errors = 0;
-    ctx->bytes_sent += bytes_to_send;
+    memcpy(s_out_buf, s_read_buf, frames * bytes_per_frame);
   }
 
-  ctx->chunks_sent++;
-  debug_log_decode_status(ctx);
+  publish_progress(ctx);
 
-  // CONFIG_FREERTOS_HZ=100 means vTaskDelay(1) blocks for a whole 10ms
-  // tick — calling it after every 32-byte chunk capped throughput at
-  // ~3.2KB/s, far below the ~16-20KB/s a 128kbps MP3 needs. DREQ
-  // (checked inside vs1053_write_sdi) is what actually paces us against
-  // the codec; this is only here often enough to keep the watchdog fed
-  // and let other tasks run.
-  if ((ctx->chunks_sent % YIELD_EVERY_N_CHUNKS) == 0) {
-    taskYIELD();
+  esp_err_t err = pcm5102_write(s_out_buf, frames);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "I2S write failed: %s", esp_err_to_name(err));
+    return END_I2S_ERROR;
   }
+  ctx->bytes_played += frames * bytes_per_frame;
   return END_NONE;
 }
 
@@ -361,23 +291,21 @@ static stream_end_t stream_until_end(stream_ctx_t* ctx) {
       continue;  // re-check the state before reading the file
     }
 
-    // In PLAYING mode: non-blocking queue check before each chunk, so a
+    // In PLAYING mode: non-blocking queue check before each block, so a
     // command (e.g. pause) doesn't wait for fread.
     player_cmd_t cmd;
     if (xQueueReceive(s_cmd_queue, &cmd, 0) == pdTRUE) {
       if (handle_cmd(&cmd)) {
         end = END_CHANGED;
       }
-      continue;  // the state may have changed (e.g. to PAUSED) — don't read a chunk yet
+      continue;  // the state may have changed (e.g. to PAUSED) — don't read a block yet
     }
 
-    if (ctx->buf_pos >= ctx->buf_len) {
-      end = refill_buffer(ctx);
-      if (end != END_NONE) {
-        continue;
-      }
+    end = refill_buffer(ctx);
+    if (end != END_NONE) {
+      continue;
     }
-    end = send_next_chunk(ctx);
+    end = send_buffer(ctx);
   }
   return end;
 }
@@ -406,9 +334,8 @@ static track_result_t finish_stream(stream_end_t end, const stream_ctx_t* ctx) {
       ESP_LOGE(TAG, "SD read error (errno %d), stopping playback", ctx->read_errno);
       return TRACK_FINISHED;
 
-    case END_CODEC_ERROR:
-      ESP_LOGE(TAG, "VS1053 unresponsive after %d consecutive errors, stopping playback",
-               MAX_CONSECUTIVE_CODEC_ERRORS);
+    case END_I2S_ERROR:
+      ESP_LOGE(TAG, "I2S output failed, stopping playback");
       return TRACK_FINISHED;
 
     default:
@@ -430,12 +357,24 @@ static track_result_t stream_current_track(void) {
 
   ESP_LOGI(TAG, "Streaming %s", path);
 
-  read_track_info(path, ctx.file, &ctx.info);
+  // Also leaves the file at the first audio byte. An unsupported or broken
+  // file is logged by wav_get_info() and stops playback.
+  if (read_track_info(path, ctx.file, &ctx.info) != ESP_OK) {
+    ESP_LOGE(TAG, "Cannot play %s", path);
+    fclose(ctx.file);
+    return TRACK_FINISHED;
+  }
+  ctx.bytes_left = ctx.info.data_size;
   player_state_set_progress(0, ctx.info.duration_sec);
   ctx.last_progress_us = esp_timer_get_time();
 
+  // Also drops whatever the previous track left in the DMA buffers.
+  if (pcm5102_set_sample_rate(ctx.info.sample_rate) != ESP_OK) {
+    fclose(ctx.file);
+    return TRACK_FINISHED;
+  }
+
   player_state_set_playback(PLAYBACK_PLAYING);
-  send_codec_filler();
 
   track_result_t result = finish_stream(stream_until_end(&ctx), &ctx);
   fclose(ctx.file);
@@ -505,6 +444,12 @@ esp_err_t audio_task_init(QueueHandle_t cmd_queue, SemaphoreHandle_t spi_mutex) 
 
   s_cmd_queue = cmd_queue;
   s_spi_mutex = spi_mutex;
+
+  // The DAC has no volume register: apply the initial level from player_state.
+  player_state_t state;
+  player_state_get(&state);
+  pcm5102_set_volume(state.volume);
+  pcm5102_set_mute(state.muted);
 
 #if CONFIG_AUDIO_DEBUG_MODE
   ESP_LOGW(TAG, "CONFIG_AUDIO_DEBUG_MODE enabled: always playing %s, track list ignored",
