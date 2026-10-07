@@ -4,7 +4,8 @@
 
 /**
  * @brief Initializes the display and creates vDisplayTask, which redraws the
- *        screen from player_state every 250ms (only when something changed).
+ *        screen from player_state every 250ms (only when something changed; every
+ *        100ms while the name of the selected track scrolls).
  *
  * Init-order dependencies: player_state_init() and sd_card_scan_tracks() must
  * have run (the task reads the state snapshot and the track names). Takes no

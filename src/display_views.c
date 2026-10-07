@@ -15,7 +15,7 @@ static const char* TAG = "display_views";
 // ---- Layout (128x64) ----
 #define ICON_SIZE 8
 #define MAX_TIME_SEC ((99 * 60) + 59)  // "99:59" is the widest time that fits the header
-#define HEADER_TIME_CHARS 11         // "MM:SS/MM:SS"
+#define HEADER_TIME_CHARS 11           // "MM:SS/MM:SS"
 #define TIME_BUF_SIZE 16
 #define HEADER_Y 0
 #define HEADER_TIME_X 0
@@ -29,13 +29,21 @@ static const char* TAG = "display_views";
 #define LIST_ROW_H 10
 #define LIST_ROWS 5
 #define LIST_TEXT_X 4
-#define LIST_MAX_CHARS 15  // (128 - 2 * LIST_TEXT_X) / GLYPH_SIZE
+#define LIST_MAX_CHARS 15                           // (128 - 2 * LIST_TEXT_X) / GLYPH_SIZE
+#define LIST_TEXT_PX (LIST_MAX_CHARS * GLYPH_SIZE)  // width of the text window
+
+// ---- Scrolling of a selected name that does not fit (marquee) ----
+// hold at the start -> scroll left until the last character is visible -> hold -> start over.
+#define SCROLL_HOLD_MS 1200
+#define SCROLL_SPEED_PX_PER_S 30
+#define MS_PER_SEC 1000U
 
 // 8x8 icons, row-major, MSB = leftmost pixel (format of display_draw_bitmap)
 static const uint8_t ICON_PLAY[8] = {0x80, 0xC0, 0xE0, 0xF0, 0xF0, 0xE0, 0xC0, 0x80};
 static const uint8_t ICON_PAUSE[8] = {0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66};
 static const uint8_t ICON_STOP[8] = {0x00, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x00};
-static const uint8_t ICON_MUTE[8] = {0x10, 0x30, 0xF5, 0xF2, 0xF5, 0x30, 0x10, 0x00};  // speaker + x
+static const uint8_t ICON_MUTE[8] = {0x10, 0x30, 0xF5, 0xF2,
+                                     0xF5, 0x30, 0x10, 0x00};  // speaker + x
 
 // 16x16 warning triangle with "!", same format (2 bytes per row)
 static const uint8_t ICON_WARNING[32] = {
@@ -66,6 +74,31 @@ static void format_track_name(const char* name, char* out, size_t out_size) {
   }
   memcpy(out, name, len);
   out[len] = '\0';
+}
+
+// The full name (no extension) of the selected track, as it is shown in its row. In debug mode
+// that is the file that is really played.
+static void selected_label(const player_state_t* state, char* out, size_t out_size) {
+  const char* name = sd_card_get_track_name(state->track_index);
+#if CONFIG_AUDIO_DEBUG_MODE
+  name = CONFIG_AUDIO_DEBUG_FILENAME;
+#endif
+  format_track_name(name != NULL ? name : "?", out, out_size);
+}
+
+// How many pixels the text is shifted to the left @p anim_ms after the scrolling started.
+// @p overflow_px is how much wider the text is than its window (> 0).
+static int scroll_offset_px(int overflow_px, uint32_t anim_ms) {
+  uint32_t travel_ms = ((uint32_t)overflow_px * MS_PER_SEC) / SCROLL_SPEED_PX_PER_S;
+  uint32_t cycle_ms = SCROLL_HOLD_MS + travel_ms + SCROLL_HOLD_MS;
+  uint32_t t = anim_ms % cycle_ms;
+  if (t < SCROLL_HOLD_MS) {
+    return 0;
+  }
+  if (t >= SCROLL_HOLD_MS + travel_ms) {
+    return overflow_px;
+  }
+  return (int)(((t - SCROLL_HOLD_MS) * SCROLL_SPEED_PX_PER_S) / MS_PER_SEC);
 }
 
 static void format_time(char* out, size_t out_size, const player_state_t* state) {
@@ -112,7 +145,7 @@ static void render_header(const player_state_t* state) {
 
 // Track list below the header: up to LIST_ROWS rows, the window follows
 // state->track_index, the current track is in a rounded frame.
-static void render_list(const player_state_t* state) {
+static void render_list(const player_state_t* state, uint32_t anim_ms) {
   if (state->track_count <= 0) {
     display_draw_text_centered(LIST_Y + ((LIST_ROWS / 2) * LIST_ROW_H), "No tracks");
     return;
@@ -133,15 +166,19 @@ static void render_list(const player_state_t* state) {
       break;
     }
     int y = LIST_Y + (row * LIST_ROW_H);
-    const char* name = sd_card_get_track_name(index);
+    char label[SD_MAX_NAME];
     if (index == state->track_index) {
-#if CONFIG_AUDIO_DEBUG_MODE
-      name = CONFIG_AUDIO_DEBUG_FILENAME;  // show what is really playing
-#endif
+      // The selected row shows the whole name, scrolling it if it does not fit the window.
       display_draw_rounded_frame(0, y, DISPLAY_WIDTH, LIST_ROW_H);
+      selected_label(state, label, sizeof(label));
+      int text_px = (int)strlen(label) * GLYPH_SIZE;
+      int offset = text_px > LIST_TEXT_PX ? scroll_offset_px(text_px - LIST_TEXT_PX, anim_ms) : 0;
+      display_draw_text_clipped(LIST_TEXT_X - offset, y + 1, label, LIST_TEXT_X, LIST_TEXT_PX);
+      continue;
     }
-    char label[LIST_MAX_CHARS + 1];
-    format_track_name(name != NULL ? name : "?", label, sizeof(label));
+    // The other rows are cut to the window.
+    const char* name = sd_card_get_track_name(index);
+    format_track_name(name != NULL ? name : "?", label, LIST_MAX_CHARS + 1);
     display_draw_text(LIST_TEXT_X, y + 1, label, LIST_MAX_CHARS);
   }
 }
@@ -149,28 +186,38 @@ static void render_list(const player_state_t* state) {
 // -----------------------------------------------------------------
 // Views (full-screen layouts)
 // -----------------------------------------------------------------
-static void view_player(const player_state_t* state) {
+static void view_player(const player_state_t* state, uint32_t anim_ms) {
   render_header(state);
-  render_list(state);
+  render_list(state, anim_ms);
 }
 
-static void view_no_sd(const player_state_t* state) {
+static void view_no_sd(const player_state_t* state, uint32_t anim_ms) {
   (void)state;
+  (void)anim_ms;
   display_draw_bitmap(NO_SD_ICON_X, NO_SD_ICON_Y, ICON_WARNING, NO_SD_ICON_SIZE, NO_SD_ICON_SIZE);
   display_draw_text_centered(NO_SD_TEXT_Y, NO_SD_LINE1);
   display_draw_text_centered(NO_SD_TEXT_Y + GLYPH_SIZE + NO_SD_LINE_GAP, NO_SD_LINE2);
 }
 
 // Indexed by display_view_t.
-static void (*const s_views[DISPLAY_VIEW_COUNT])(const player_state_t*) = {
+static void (*const s_views[DISPLAY_VIEW_COUNT])(const player_state_t*, uint32_t) = {
     [DISPLAY_VIEW_PLAYER] = view_player,
     [DISPLAY_VIEW_NO_SD] = view_no_sd,
 };
 
-void display_render_view(display_view_t view, const player_state_t* state) {
+void display_render_view(display_view_t view, const player_state_t* state, uint32_t anim_ms) {
   if ((int)view < 0 || view >= DISPLAY_VIEW_COUNT || s_views[view] == NULL) {
     ESP_LOGW(TAG, "Unknown view %d", (int)view);
     return;
   }
-  s_views[view](state);
+  s_views[view](state, anim_ms);
+}
+
+bool display_view_is_animated(display_view_t view, const player_state_t* state) {
+  if (view != DISPLAY_VIEW_PLAYER || state->track_count <= 0) {
+    return false;
+  }
+  char label[SD_MAX_NAME];
+  selected_label(state, label, sizeof(label));
+  return strlen(label) > LIST_MAX_CHARS;
 }

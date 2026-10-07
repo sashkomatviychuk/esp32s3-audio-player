@@ -35,6 +35,17 @@ esp_err_t display_flush(void);
  */
 void display_draw_text(int x, int y, const char* text, int max_chars);
 
+/**
+ * @brief Draws the whole @p text starting at @p x, but only the pixels inside the
+ *        window [@p clip_x, @p clip_x + @p clip_w) — the rest is cut off. @p x may be
+ *        negative or beyond the window, which is how text is scrolled.
+ *
+ * Use this instead of display_draw_text() whenever the text can leave the screen:
+ * pixel coordinates are 8-bit in the panel library, so an unclipped x outside
+ * 0..255 would wrap around and draw garbage on the other side.
+ */
+void display_draw_text_clipped(int x, int y, const char* text, int clip_x, int clip_w);
+
 /** @brief Draws @p text horizontally centered on the row at @p y. */
 void display_draw_text_centered(int y, const char* text);
 

@@ -79,25 +79,51 @@ esp_err_t display_flush(void) {
 // -----------------------------------------------------------------
 // Drawing primitives (framebuffer only)
 // -----------------------------------------------------------------
+// Draws one glyph at (x, y), only the columns inside [clip_lo, clip_hi). The window is also
+// limited to the panel, so every x handed to ssd1306_set_pixel() is in 0..DISPLAY_WIDTH - 1.
+static void draw_glyph(int x, int y, unsigned char ch, int clip_lo, int clip_hi) {
+  if (ch > FONT_LAST_CHAR) {
+    ch = '?';  // the font is Latin-only: show a placeholder for UTF-8 bytes
+  }
+  // font_latin_8x8_tr is column-major: byte = column, bit 0 = top row
+  for (int col = 0; col < GLYPH_SIZE; col++) {
+    int px = x + col;
+    if (px < clip_lo || px >= clip_hi) {
+      continue;
+    }
+    uint8_t bits = font_latin_8x8_tr[ch][col];
+    for (int row = 0; row < GLYPH_SIZE; row++) {
+      if (bits & (1 << row)) {
+        ssd1306_set_pixel(s_display, (uint8_t)px, (uint8_t)(y + row), false);
+      }
+    }
+  }
+}
+
 void display_draw_text(int x, int y, const char* text, int max_chars) {
   if (s_display == NULL) {
     return;
   }
   for (int i = 0; i < max_chars && text[i] != '\0'; i++) {
-    unsigned char ch = (unsigned char)text[i];
-    if (ch > FONT_LAST_CHAR) {
-      ch = '?';  // the font is Latin-only: show a placeholder for UTF-8 bytes
+    draw_glyph(x + (i * GLYPH_SIZE), y, (unsigned char)text[i], 0, DISPLAY_WIDTH);
+  }
+}
+
+void display_draw_text_clipped(int x, int y, const char* text, int clip_x, int clip_w) {
+  if (s_display == NULL) {
+    return;
+  }
+  int clip_lo = clip_x < 0 ? 0 : clip_x;
+  int clip_hi = clip_x + clip_w > DISPLAY_WIDTH ? DISPLAY_WIDTH : clip_x + clip_w;
+  for (int i = 0; text[i] != '\0'; i++) {
+    int gx = x + (i * GLYPH_SIZE);
+    if (gx + GLYPH_SIZE <= clip_lo) {
+      continue;  // not in the window yet
     }
-    // font_latin_8x8_tr is column-major: byte = column, bit 0 = top row
-    for (int col = 0; col < GLYPH_SIZE; col++) {
-      uint8_t bits = font_latin_8x8_tr[ch][col];
-      for (int row = 0; row < GLYPH_SIZE; row++) {
-        if (bits & (1 << row)) {
-          ssd1306_set_pixel(s_display, (uint8_t)(x + (i * GLYPH_SIZE) + col), (uint8_t)(y + row),
-                            false);
-        }
-      }
+    if (gx >= clip_hi) {
+      break;  // past the window: the rest is too
     }
+    draw_glyph(gx, y, (unsigned char)text[i], clip_lo, clip_hi);
   }
 }
 
