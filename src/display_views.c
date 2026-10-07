@@ -4,6 +4,7 @@
 #include <string.h>
 #include <strings.h>
 
+#include "audio_decoder.h"
 #include "audio_task.h"
 #include "display.h"
 #include "esp_log.h"
@@ -57,11 +58,8 @@ static const uint8_t ICON_WARNING[32] = {
 // (NUL-terminated, cut to out_size - 1 characters).
 static void format_track_name(const char* name, char* out, size_t out_size) {
   size_t len = strlen(name);
-  if (len > 4) {
-    const char* ext = name + len - 4;
-    if (strcasecmp(ext, ".wav") == 0 || strcasecmp(ext, ".mp3") == 0) {
-      len -= 4;
-    }
+  if (audio_format_from_name(name) != AUDIO_FORMAT_UNKNOWN) {
+    len -= 4;  // both extensions are 4 characters (".wav", ".mp3")
   }
   if (len > out_size - 1) {
     len = out_size - 1;

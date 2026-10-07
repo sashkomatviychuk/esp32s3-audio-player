@@ -161,6 +161,8 @@ void mp3_get_info(FILE* f, size_t file_size, mp3_info_t* out) {
   out->duration_sec = 0;
   out->bitrate_bps = 0;
   out->audio_start = 0;
+  out->sample_rate = 0;
+  out->channels = 0;
   if (f == NULL || file_size == 0) {
     return;
   }
@@ -182,6 +184,11 @@ void mp3_get_info(FILE* f, size_t file_size, mp3_info_t* out) {
       const int16_t* table = header.version == MPEG_VERSION_1 ? BITRATE_MPEG1_L3 : BITRATE_MPEG2_L3;
       bitrate = (uint32_t)table[header.bitrateIdx] * BITS_PER_KBIT;
       xing_duration_sec = read_xing_duration(buf, n, frame_pos, &header);
+      if (header.sampleRateIdx != SAMPLE_RATE_IDX_RESERVED) {
+        out->sample_rate = SAMPLE_RATE_MPEG1[header.sampleRateIdx] >>
+                           sample_rate_shift(header.version);
+        out->channels = header.channelMode == CHANNEL_MODE_MONO ? 1 : 2;
+      }
 #if CONFIG_AUDIO_DEBUG_MP3_INFO_LOG
       ESP_LOGI(TAG,
                "First frame: file %u B, audio_start %u, frame_pos %u, MPEG ver %d, bitrate idx %d "

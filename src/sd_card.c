@@ -1,10 +1,10 @@
 #include "sd_card.h"
 
-#include <ctype.h>
 #include <dirent.h>
 #include <stdio.h>
 #include <string.h>
 
+#include "audio_decoder.h"
 #include "driver/sdspi_host.h"
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
@@ -151,14 +151,10 @@ const char* sd_card_get_mount_point(void) {
   return MOUNT_POINT;
 }
 
-static bool has_wav_extension(const char* name) {
-  size_t len = strlen(name);
-  if (len < 4) {
-    return false;
-  }
-  const char* ext = name + len - 4;
-  return ext[0] == '.' && tolower((unsigned char)ext[1]) == 'w' &&
-         tolower((unsigned char)ext[2]) == 'a' && tolower((unsigned char)ext[3]) == 'v';
+// Only formats audio_task can decode (.wav, .mp3) are listed; everything else on the card is
+// ignored.
+static bool is_playable_file(const char* name) {
+  return audio_format_from_name(name) != AUDIO_FORMAT_UNKNOWN;
 }
 
 esp_err_t sd_card_scan_tracks(SemaphoreHandle_t spi_mutex) {
@@ -182,10 +178,10 @@ esp_err_t sd_card_scan_tracks(SemaphoreHandle_t spi_mutex) {
   int count = 0;
   struct dirent* entry;
   while ((entry = readdir(dir)) != NULL) {
-    // Skip hidden files too: macOS leaves "._name.wav" AppleDouble stubs next
-    // to the real tracks on cards written from a Mac — they match ".wav" but
+    // Skip hidden files too: macOS leaves "._name.mp3" AppleDouble stubs next
+    // to the real tracks on cards written from a Mac — they match ".mp3" but
     // aren't playable audio.
-    if (entry->d_type == DT_DIR || entry->d_name[0] == '.' || !has_wav_extension(entry->d_name)) {
+    if (entry->d_type == DT_DIR || entry->d_name[0] == '.' || !is_playable_file(entry->d_name)) {
       continue;
     }
     if (count >= SD_MAX_TRACKS) {
@@ -205,9 +201,9 @@ esp_err_t sd_card_scan_tracks(SemaphoreHandle_t spi_mutex) {
 
   s_track_count = count;
   player_state_set_track_count(count);
-  ESP_LOGI(TAG, "Found %d .wav track(s)", count);
+  ESP_LOGI(TAG, "Found %d track(s) (.mp3/.wav)", count);
   if (count == 0) {
-    ESP_LOGW(TAG, "No .wav files found in %s", MOUNT_POINT);
+    ESP_LOGW(TAG, "No .mp3/.wav files found in %s", MOUNT_POINT);
   }
   return ESP_OK;
 }

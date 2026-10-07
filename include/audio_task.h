@@ -17,7 +17,8 @@
  *
  * @param cmd_queue   Shared command Queue (created in main.c,
  *                    written to by input_task and ble_task)
- * @param spi_mutex   Mutex protecting the shared SPI bus (VS1053 + SD card)
+ * @param spi_mutex   Mutex serializing SD card access (taken around every SD read, also
+ *                    inside the decoders)
  *
  * Init-order dependencies: the SD card must be mounted (sd_card_init), the
  * track list scanned (sd_card_scan_tracks) and player_state_init() called

@@ -1,10 +1,8 @@
 #include "audio_task.h"
 
-#include <errno.h>
 #include <stdio.h>
-#include <string.h>
-#include <sys/stat.h>
 
+#include "audio_decoder.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/task.h"
@@ -12,22 +10,18 @@
 #include "player_state.h"
 #include "player_types.h"
 #include "sd_card.h"
-#include "wav_info.h"
 
 static const char* TAG = "audio_task";
 
-#define AUDIO_TASK_STACK_SIZE 4096
+// Helix keeps its state on the heap, but a decode call, the logging and the SD/FATFS calls
+// below it need stack headroom.
+#define AUDIO_TASK_STACK_SIZE 8192
 #define AUDIO_TASK_PRIORITY 5
 #define PROGRESS_UPDATE_PERIOD_US 500000  // how often elapsed time is published
 #define SD_POLL_PERIOD_MS 200             // how often idle/paused states check the SD card
 #define VOLUME_STEP 5                     // percent per CMD_VOLUME_UP / CMD_VOLUME_DOWN
 #define PATH_EXTRA_CHARS 16               // room for "<mount point>/" around a track name
-
-// One SD read = one I2S write. At 44.1 kHz stereo 2048 bytes are ~12 ms of
-// audio, far less than the DMA buffer in pcm5102.c (~87 ms), so a slow SD read
-// does not starve the DAC, and a command waits at most one block. Must be a
-// multiple of 4 (one stereo frame) so a block never ends mid-frame.
-#define READ_BUF_SIZE 2048
+#define US_PER_SEC 1000000U
 
 // CONFIG_AUDIO_DEBUG_* options come from src/Kconfig.projbuild
 
@@ -62,44 +56,18 @@ static bool sd_is_present(void) {
   return state.sd_present;
 }
 
-// Reads the WAV header (length, format) for the display and the stream. Reads
-// the file head, so it needs spi_mutex (the SD card is shared with the scan
-// task). Leaves the file positioned at the first audio byte.
-static esp_err_t read_track_info(const char* path, FILE* f, wav_info_t* info) {
-  struct stat st;
-  if (stat(path, &st) != 0 || xSemaphoreTake(s_spi_mutex, portMAX_DELAY) != pdTRUE) {
-    return ESP_FAIL;
-  }
-  esp_err_t err = wav_get_info(f, (size_t)st.st_size, info);
-  xSemaphoreGive(s_spi_mutex);
-  return err;
-}
-
-// Opens the track at player_state's current index and stores its path in
-// @p path. Returns NULL (after logging) if there is no such track or it
-// cannot be opened.
-static FILE* open_current_track(char* path, size_t path_size) {
-  if (get_current_track_path(path, path_size) != ESP_OK) {
-    ESP_LOGE(TAG, "No track to play");
-    return NULL;
-  }
-  FILE* f = fopen(path, "rb");
-  if (f == NULL) {
-    ESP_LOGE(TAG, "Failed to open file %s", path);
-  }
-  return f;
-}
-
-// Publishes the duration of the current track without starting playback.
+// Publishes the duration of the current track without starting playback. Only the file
+// header is read — no decoder is created.
 static void load_track_duration(void) {
   char path[SD_MAX_NAME + PATH_EXTRA_CHARS];
-  FILE* f = open_current_track(path, sizeof(path));
-  if (f == NULL) {
+  if (get_current_track_path(path, sizeof(path)) != ESP_OK) {
+    ESP_LOGE(TAG, "No track to play");
     return;
   }
-  wav_info_t info = {0};
-  read_track_info(path, f, &info);
-  fclose(f);
+  audio_track_info_t info;
+  if (audio_decoder_probe(path, s_spi_mutex, &info) != ESP_OK) {
+    return;
+  }
   player_state_set_progress(0, info.duration_sec);
 }
 
@@ -164,51 +132,45 @@ static bool handle_cmd(const player_cmd_t* cmd) {
 
 typedef enum {
   TRACK_EOF,       // the file was played to its end — the caller may advance to the next track
-  TRACK_FINISHED,  // aborted: I2S/SD error, SD removed, or the track could not be played
+  TRACK_FINISHED,  // aborted: decode/I2S/SD error, SD removed, or the track could not be played
   TRACK_CHANGED,   // a command selected another track — start it right away
 } track_result_t;
 
 // Why the streaming loop ended; END_NONE means "keep streaming".
 typedef enum {
   END_NONE,
-  END_EOF,         // real end of the audio data
-  END_CHANGED,     // a command switched the track
-  END_SD_REMOVED,  // the card was pulled
-  END_READ_ERROR,  // fread() failed (e.g. an SD CRC error), not a real EOF
-  END_I2S_ERROR,   // the I2S write failed
+  END_EOF,           // real end of the audio data
+  END_CHANGED,       // a command switched the track
+  END_SD_REMOVED,    // the card was pulled
+  END_READ_ERROR,    // the SD read failed (e.g. an SD CRC error), not a real EOF
+  END_DECODE_ERROR,  // the decoder gave up on a corrupt file
+  END_I2S_ERROR,     // the I2S write failed
 } stream_end_t;
 
 // Per-track streaming state, owned by stream_current_track().
 typedef struct {
-  FILE* file;
-  wav_info_t info;
-  // Elapsed time is derived from the audio bytes handed to the DAC. The I2S
-  // write blocks until the DMA has room, so this follows real playback within
-  // the DMA depth; pause is accounted for automatically because no bytes are
-  // sent while paused.
-  uint64_t bytes_played;
-  uint32_t bytes_left;  // audio bytes not yet read from the file
+  audio_decoder_t decoder;
+  audio_track_info_t info;
+  uint32_t sample_rate;  // rate the I2S clock is set to; follows decoder.sample_rate
+  // Elapsed time is the duration of the PCM handed to the DAC. The I2S write blocks until
+  // the DMA has room, so this follows real playback within the DMA depth; pause is accounted
+  // for automatically because nothing is written while paused.
+  uint64_t elapsed_us;
   int64_t last_progress_us;
-  size_t buf_len;  // valid bytes in s_read_buf
-  int read_errno;  // errno of the failed fread (END_READ_ERROR)
 } stream_ctx_t;
 
-static int16_t s_read_buf[READ_BUF_SIZE / sizeof(int16_t)];  // samples as read from the file
-static int16_t s_out_buf[READ_BUF_SIZE];                     // always stereo: 2x a mono block
+// Decoded stereo frames of one block, always interleaved L/R whatever the file format is.
+static int16_t s_out_buf[AUDIO_DECODER_OUT_SAMPLES];
 
 // Publishes the playback position for the display, at most once per
 // PROGRESS_UPDATE_PERIOD_US.
 static void publish_progress(stream_ctx_t* ctx) {
-  if (ctx->info.byte_rate == 0) {
-    return;
-  }
   int64_t now_us = esp_timer_get_time();
   if (now_us - ctx->last_progress_us < PROGRESS_UPDATE_PERIOD_US) {
     return;
   }
   ctx->last_progress_us = now_us;
-  player_state_set_progress((uint32_t)(ctx->bytes_played / ctx->info.byte_rate),
-                            ctx->info.duration_sec);
+  player_state_set_progress((uint32_t)(ctx->elapsed_us / US_PER_SEC), ctx->info.duration_sec);
 }
 
 // While paused: blocks on the queue (near 0% CPU). The timeout only exists to
@@ -221,63 +183,41 @@ static stream_end_t wait_while_paused(void) {
   return sd_is_present() ? END_NONE : END_SD_REMOVED;
 }
 
-// Refills the read buffer from the SD card with the next block of audio data,
-// never reading past the end of the "data" chunk. Returns END_NONE when new
-// data is available.
-static stream_end_t refill_buffer(stream_ctx_t* ctx) {
+// Decodes the next block of the track and sends it to the DAC. Both calls can block (the SD read
+// and decode take a few ms, the I2S write waits for DMA space), which also paces the stream.
+static stream_end_t play_next_block(stream_ctx_t* ctx) {
   if (!sd_is_present()) {
     return END_SD_REMOVED;
   }
-  if (ctx->bytes_left == 0) {
+
+  size_t frames = 0;
+  esp_err_t err = ctx->decoder.read(&ctx->decoder, s_out_buf, AUDIO_DECODER_MAX_FRAMES, &frames);
+  if (err == ESP_FAIL) {
+    return END_READ_ERROR;
+  }
+  if (err != ESP_OK) {
+    return END_DECODE_ERROR;
+  }
+  if (frames == 0) {
     return END_EOF;
   }
 
-  size_t to_read = ctx->bytes_left < READ_BUF_SIZE ? ctx->bytes_left : READ_BUF_SIZE;
-  size_t len = 0;
-  if (xSemaphoreTake(s_spi_mutex, portMAX_DELAY) == pdTRUE) {
-    len = fread(s_read_buf, 1, to_read, ctx->file);
-    xSemaphoreGive(s_spi_mutex);
-  }
-  ctx->buf_len = len;
-  if (len > 0) {
-    ctx->bytes_left -= (uint32_t)len;
-    return END_NONE;
-  }
-
-  // fread() returns 0 both at a real EOF (a file shorter than its header
-  // claims) and on a read error (e.g. an SD CRC failure) — ferror() tells them
-  // apart.
-  if (ferror(ctx->file)) {
-    ctx->read_errno = errno;
-    return END_READ_ERROR;
-  }
-  return END_EOF;
-}
-
-// Converts the block in s_read_buf to stereo (a mono sample is duplicated into
-// both channels, so the I2S format never changes) and sends it to the DAC.
-// Blocks until the DMA accepted all of it, which paces the whole stream.
-static stream_end_t send_buffer(stream_ctx_t* ctx) {
-  size_t bytes_per_frame = ctx->info.channels * sizeof(int16_t);
-  size_t frames = ctx->buf_len / bytes_per_frame;
-
-  if (ctx->info.channels == 1) {
-    for (size_t i = 0; i < frames; i++) {
-      s_out_buf[2 * i] = s_read_buf[i];
-      s_out_buf[(2 * i) + 1] = s_read_buf[i];
+  // A stream that changes its sample rate midway (rare) needs a new I2S clock.
+  if (ctx->decoder.sample_rate != ctx->sample_rate) {
+    ctx->sample_rate = ctx->decoder.sample_rate;
+    if (pcm5102_set_sample_rate(ctx->sample_rate) != ESP_OK) {
+      return END_I2S_ERROR;
     }
-  } else {
-    memcpy(s_out_buf, s_read_buf, frames * bytes_per_frame);
   }
 
   publish_progress(ctx);
 
-  esp_err_t err = pcm5102_write(s_out_buf, frames);
+  err = pcm5102_write(s_out_buf, frames);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "I2S write failed: %s", esp_err_to_name(err));
     return END_I2S_ERROR;
   }
-  ctx->bytes_played += frames * bytes_per_frame;
+  ctx->elapsed_us += ((uint64_t)frames * US_PER_SEC) / ctx->sample_rate;
   return END_NONE;
 }
 
@@ -292,20 +232,16 @@ static stream_end_t stream_until_end(stream_ctx_t* ctx) {
     }
 
     // In PLAYING mode: non-blocking queue check before each block, so a
-    // command (e.g. pause) doesn't wait for fread.
+    // command (e.g. pause) doesn't wait for the decoder.
     player_cmd_t cmd;
     if (xQueueReceive(s_cmd_queue, &cmd, 0) == pdTRUE) {
       if (handle_cmd(&cmd)) {
         end = END_CHANGED;
       }
-      continue;  // the state may have changed (e.g. to PAUSED) — don't read a block yet
+      continue;  // the state may have changed (e.g. to PAUSED) — don't decode a block yet
     }
 
-    end = refill_buffer(ctx);
-    if (end != END_NONE) {
-      continue;
-    }
-    end = send_buffer(ctx);
+    end = play_next_block(ctx);
   }
   return end;
 }
@@ -314,8 +250,8 @@ static stream_end_t stream_until_end(stream_ctx_t* ctx) {
 static track_result_t finish_stream(stream_end_t end, const stream_ctx_t* ctx) {
   switch (end) {
     case END_EOF:
-      // The periodic update can lag up to PROGRESS_UPDATE_PERIOD_US and the byte
-      // count is rounded down, so snap to the full length once the file is done.
+      // The periodic update can lag up to PROGRESS_UPDATE_PERIOD_US and the elapsed time is
+      // rounded down, so snap to the full length once the file is done.
       if (ctx->info.duration_sec > 0) {
         player_state_set_progress(ctx->info.duration_sec, ctx->info.duration_sec);
       }
@@ -331,7 +267,11 @@ static track_result_t finish_stream(stream_end_t end, const stream_ctx_t* ctx) {
       return TRACK_FINISHED;
 
     case END_READ_ERROR:
-      ESP_LOGE(TAG, "SD read error (errno %d), stopping playback", ctx->read_errno);
+      ESP_LOGE(TAG, "SD read error (errno %d), stopping playback", ctx->decoder.read_errno);
+      return TRACK_FINISHED;
+
+    case END_DECODE_ERROR:
+      ESP_LOGE(TAG, "Cannot decode the file, stopping playback");
       return TRACK_FINISHED;
 
     case END_I2S_ERROR:
@@ -343,41 +283,54 @@ static track_result_t finish_stream(stream_end_t end, const stream_ctx_t* ctx) {
   }
 }
 
+static const char* format_name(audio_format_t format) {
+  switch (format) {
+    case AUDIO_FORMAT_WAV:
+      return "WAV";
+    case AUDIO_FORMAT_MP3:
+      return "MP3";
+    default:
+      return "?";
+  }
+}
+
 // Streams the track at player_state's current index until it ends or a
 // command switches the track. Sets the state to PLAYING on entry (so a
 // track change also clears a pause); the caller sets STOPPED when there is
 // nothing more to play (TRACK_FINISHED, or TRACK_EOF on the last track).
 static track_result_t stream_current_track(void) {
   char path[SD_MAX_NAME + PATH_EXTRA_CHARS];
-  stream_ctx_t ctx = {0};
-  ctx.file = open_current_track(path, sizeof(path));
-  if (ctx.file == NULL) {
+  if (get_current_track_path(path, sizeof(path)) != ESP_OK) {
+    ESP_LOGE(TAG, "No track to play");
     return TRACK_FINISHED;
   }
 
   ESP_LOGI(TAG, "Streaming %s", path);
 
-  // Also leaves the file at the first audio byte. An unsupported or broken
-  // file is logged by wav_get_info() and stops playback.
-  if (read_track_info(path, ctx.file, &ctx.info) != ESP_OK) {
+  stream_ctx_t ctx = {0};
+  // An unsupported or broken file is logged by the decoder and stops playback.
+  if (audio_decoder_open(path, s_spi_mutex, &ctx.decoder, &ctx.info) != ESP_OK) {
     ESP_LOGE(TAG, "Cannot play %s", path);
-    fclose(ctx.file);
     return TRACK_FINISHED;
   }
-  ctx.bytes_left = ctx.info.data_size;
+  ESP_LOGI(TAG, "%s, %u Hz, %u ch, %u s", format_name(ctx.info.format),
+           (unsigned)ctx.info.sample_rate, ctx.info.channels, (unsigned)ctx.info.duration_sec);
+
   player_state_set_progress(0, ctx.info.duration_sec);
   ctx.last_progress_us = esp_timer_get_time();
 
   // Also drops whatever the previous track left in the DMA buffers.
-  if (pcm5102_set_sample_rate(ctx.info.sample_rate) != ESP_OK) {
-    fclose(ctx.file);
+  ctx.sample_rate = ctx.decoder.sample_rate;
+  if (pcm5102_set_sample_rate(ctx.sample_rate) != ESP_OK) {
+    audio_decoder_close(&ctx.decoder);
     return TRACK_FINISHED;
   }
 
   player_state_set_playback(PLAYBACK_PLAYING);
 
   track_result_t result = finish_stream(stream_until_end(&ctx), &ctx);
-  fclose(ctx.file);
+  audio_decoder_close(&ctx.decoder);
+  ESP_LOGI(TAG, "Stack high-water mark: %u bytes", (unsigned)uxTaskGetStackHighWaterMark(NULL));
   return result;
 }
 
