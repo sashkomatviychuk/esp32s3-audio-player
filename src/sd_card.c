@@ -8,8 +8,8 @@
 #include "driver/sdspi_host.h"
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
-#include "player_state.h"
 #include "freertos/task.h"
+#include "player_state.h"
 #include "sdmmc_cmd.h"
 
 static const char* TAG = "sd_card";
@@ -25,7 +25,7 @@ static const char* TAG = "sd_card";
 // gave ~35 KB/s. If "data CRC failed" shows up mid-stream again, lower this or
 // fix the wiring — see the speed history in try_mount().
 #define SD_MAX_FREQ_KHZ 4000
-#define SD_WAIT_FOR_MISO_MS 100    // "card ready" polling window (driver default is 40)
+#define SD_WAIT_FOR_MISO_MS 100  // "card ready" polling window (driver default is 40)
 #define SD_MAX_OPEN_FILES 5
 #define SD_ALLOCATION_UNIT_SIZE 512  // FAT/SD sector size
 #define SPI_MAX_TRANSFER_SIZE 4000
@@ -38,6 +38,9 @@ static int s_track_count = 0;
 static sdmmc_card_t* s_card = NULL;  // non-NULL while the card is mounted
 static bool s_bus_ready = false;     // SPI2 bus is initialized once, never freed
 static bool s_published = false;     // tracks scanned and sd_present published for this mount
+// Name of the track that was current when the card dropped out ("" = none). Lets the same track
+// be selected again after the card is back, instead of falling back to track 0.
+static char s_resume_name[SD_MAX_NAME] = "";
 
 #define MONITOR_TASK_STACK_SIZE 4096
 #define MONITOR_TASK_PRIORITY 1  // lowest: only retries mounts / probes the card
@@ -85,10 +88,9 @@ esp_err_t sd_card_try_mount(void) {
   // (CMD24) work fine. Pre-format the card as FAT32 on a PC (use the SD
   // Association's SD Card Formatter for cards >32GB / if Windows defaults to
   // exFAT) instead of relying on on-device formatting.
-  esp_vfs_fat_sdmmc_mount_config_t mount_config = {
-      .format_if_mount_failed = false,
-      .max_files = SD_MAX_OPEN_FILES,
-      .allocation_unit_size = SD_ALLOCATION_UNIT_SIZE};
+  esp_vfs_fat_sdmmc_mount_config_t mount_config = {.format_if_mount_failed = false,
+                                                   .max_files = SD_MAX_OPEN_FILES,
+                                                   .allocation_unit_size = SD_ALLOCATION_UNIT_SIZE};
 
   sdmmc_host_t host = SDSPI_HOST_DEFAULT();
   // The SD/VS1053 SPI bus runs on ~15-20cm breadboard wiring, which was
@@ -157,6 +159,27 @@ static bool is_playable_file(const char* name) {
   return audio_format_from_name(name) != AUDIO_FORMAT_UNKNOWN;
 }
 
+// After a card drop-out the freshly scanned list may be ordered differently and
+// player_state_set_track_count() has reset the index to 0, so find the remembered track by its
+// file name and select it again. Runs before sd_present is published, so audio_task never sees
+// the wrong track. The remembered name is used once.
+static void restore_remembered_track(void) {
+  if (s_resume_name[0] == '\0') {
+    return;
+  }
+  for (int i = 0; i < s_track_count; i++) {
+    if (strcmp(s_tracks[i], s_resume_name) == 0) {
+      if (player_state_select_track(i) == ESP_OK) {
+        ESP_LOGI(TAG, "Card is back: current track restored to %d (%s)", i, s_resume_name);
+      }
+      s_resume_name[0] = '\0';
+      return;
+    }
+  }
+  ESP_LOGW(TAG, "Card is back, but track \"%s\" is not on it any more", s_resume_name);
+  s_resume_name[0] = '\0';
+}
+
 esp_err_t sd_card_scan_tracks(SemaphoreHandle_t spi_mutex) {
   if (spi_mutex == NULL) {
     ESP_LOGE(TAG, "sd_card_scan_tracks: invalid arguments");
@@ -201,6 +224,7 @@ esp_err_t sd_card_scan_tracks(SemaphoreHandle_t spi_mutex) {
 
   s_track_count = count;
   player_state_set_track_count(count);
+  restore_remembered_track();
   ESP_LOGI(TAG, "Found %d track(s) (.mp3/.wav)", count);
   if (count == 0) {
     ESP_LOGW(TAG, "No .mp3/.wav files found in %s", MOUNT_POINT);
@@ -236,7 +260,22 @@ esp_err_t sd_card_get_track_path(int index, char* buf, size_t buf_size) {
 // -----------------------------------------------------------------
 // Hot-plug monitor
 // -----------------------------------------------------------------
+// Remembers the current track by name before the list is thrown away. Only a card that was fully
+// published has a valid list: a failed first scan must not overwrite an earlier remembered name.
+static void remember_current_track(void) {
+  if (!s_published) {
+    return;
+  }
+  player_state_t state;
+  player_state_get(&state);
+  if (state.track_index >= 0 && state.track_index < s_track_count) {
+    strcpy(s_resume_name, s_tracks[state.track_index]);
+    ESP_LOGI(TAG, "Remembering current track: %s", s_resume_name);
+  }
+}
+
 static void unmount_card(void) {
+  remember_current_track();
   esp_vfs_fat_sdcard_unmount(MOUNT_POINT, s_card);
   s_card = NULL;
   s_published = false;
@@ -291,8 +330,8 @@ esp_err_t sd_card_monitor_init(SemaphoreHandle_t spi_mutex) {
   // First pass synchronously so the track list is ready before audio_task
   monitor_step(spi_mutex);
 
-  BaseType_t created = xTaskCreate(monitor_task, "sd_monitor", MONITOR_TASK_STACK_SIZE,
-                                   spi_mutex, MONITOR_TASK_PRIORITY, NULL);
+  BaseType_t created = xTaskCreate(monitor_task, "sd_monitor", MONITOR_TASK_STACK_SIZE, spi_mutex,
+                                   MONITOR_TASK_PRIORITY, NULL);
   if (created != pdPASS) {
     ESP_LOGE(TAG, "Failed to create sd_monitor task");
     return ESP_FAIL;

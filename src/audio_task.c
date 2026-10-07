@@ -22,6 +22,9 @@ static const char* TAG = "audio_task";
 #define VOLUME_STEP 5                     // percent per CMD_VOLUME_UP / CMD_VOLUME_DOWN
 #define PATH_EXTRA_CHARS 16               // room for "<mount point>/" around a track name
 #define US_PER_SEC 1000000U
+// How long after an SD drop-out the playback is still restarted automatically once the card is
+// back. Later than that the user is assumed to have moved on (e.g. swapped the card).
+#define RESUME_WINDOW_US (30 * US_PER_SEC)
 
 // CONFIG_AUDIO_DEBUG_* options come from src/Kconfig.projbuild
 
@@ -132,7 +135,8 @@ static bool handle_cmd(const player_cmd_t* cmd) {
 
 typedef enum {
   TRACK_EOF,       // the file was played to its end — the caller may advance to the next track
-  TRACK_FINISHED,  // aborted: decode/I2S/SD error, SD removed, or the track could not be played
+  TRACK_FINISHED,  // aborted: decode/I2S error, or the track could not be played
+  TRACK_SD_LOST,   // aborted because the SD card dropped out or a read failed: may resume later
   TRACK_CHANGED,   // a command selected another track — start it right away
 } track_result_t;
 
@@ -264,11 +268,11 @@ static track_result_t finish_stream(stream_end_t end, const stream_ctx_t* ctx) {
 
     case END_SD_REMOVED:
       ESP_LOGW(TAG, "SD card removed, stopping playback");
-      return TRACK_FINISHED;
+      return TRACK_SD_LOST;
 
     case END_READ_ERROR:
       ESP_LOGE(TAG, "SD read error (errno %d), stopping playback", ctx->decoder.read_errno);
-      return TRACK_FINISHED;
+      return TRACK_SD_LOST;
 
     case END_DECODE_ERROR:
       ESP_LOGE(TAG, "Cannot decode the file, stopping playback");
@@ -348,10 +352,49 @@ static void probe_duration_if_needed(bool* probed) {
   }
 }
 
+// Restarts the track that an SD drop-out cut short, once the card has gone away and come back
+// (sd_card then selects the same track again by name). Playback restarts from the beginning of the
+// track. Any user command or RESUME_WINDOW_US without the card returning cancels it.
+typedef struct {
+  bool pending;    // playback was cut by an SD problem and not restarted/cancelled yet
+  bool card_lost;  // the card has been seen absent since then
+  int64_t deadline_us;
+} sd_resume_t;
+
+static void sd_resume_arm(sd_resume_t* resume) {
+  resume->pending = true;
+  resume->card_lost = !sd_is_present();  // the monitor may not have noticed the drop-out yet
+  resume->deadline_us = esp_timer_get_time() + RESUME_WINDOW_US;
+  ESP_LOGW(TAG, "Playback cut by an SD problem, will restart when the card is back");
+}
+
+// True when playback should be restarted now.
+static bool sd_resume_due(sd_resume_t* resume) {
+  if (!resume->pending) {
+    return false;
+  }
+  if (esp_timer_get_time() > resume->deadline_us) {
+    ESP_LOGW(TAG, "The card did not come back in time, automatic restart cancelled");
+    resume->pending = false;
+    return false;
+  }
+  if (!sd_is_present()) {
+    resume->card_lost = true;
+    return false;
+  }
+  if (!resume->card_lost) {
+    return false;  // read error, but the monitor still sees the card: wait for it to decide
+  }
+  resume->pending = false;
+  ESP_LOGI(TAG, "SD card is back, restarting playback");
+  return true;
+}
+
 static void audio_task(void* arg) {
   player_cmd_t cmd;
   bool start_track = true;  // autoplay the current track on startup
   bool duration_probed = false;
+  sd_resume_t resume = {0};
 
   // The task never exits: after a track ends it waits for commands so
   // Next/Prev/Select/Play can start another track.
@@ -360,6 +403,9 @@ static void audio_task(void* arg) {
       track_result_t result = stream_current_track();
       if (result == TRACK_CHANGED) {
         continue;  // start_track stays true: open the newly selected track
+      }
+      if (result == TRACK_SD_LOST) {
+        sd_resume_arm(&resume);
       }
       // Auto-advance only after a real end of file, never after an error.
       if (result == TRACK_EOF) {
@@ -378,10 +424,16 @@ static void audio_task(void* arg) {
     // --- STOPPED: block on the Queue (near 0% CPU). The timeout lets us probe
     //     the track length once the SD card is back ---
     if (xQueueReceive(s_cmd_queue, &cmd, pdMS_TO_TICKS(SD_POLL_PERIOD_MS)) == pdTRUE) {
+      resume.pending = false;  // the user is in control now
       bool track_changed = handle_cmd(&cmd);
       if (sd_is_present() && (track_changed || cmd.type == CMD_PLAY_PAUSE)) {
         start_track = true;  // track changed, or Play pressed — (re)start current track
       }
+      continue;
+    }
+
+    if (sd_resume_due(&resume)) {
+      start_track = true;
       continue;
     }
 
