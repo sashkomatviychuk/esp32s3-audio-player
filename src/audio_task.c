@@ -7,6 +7,7 @@
 #include "esp_timer.h"
 #include "freertos/task.h"
 #include "pcm5102.h"
+#include "player_fsm.h"
 #include "player_state.h"
 #include "player_types.h"
 #include "sd_card.h"
@@ -74,33 +75,48 @@ static void load_track_duration(void) {
   player_state_set_progress(0, info.duration_sec);
 }
 
-// Returns true if the command changed the current track (the caller must
-// stop the current stream and start the track at player_state's index).
-static bool handle_cmd(const player_cmd_t* cmd) {
+// Feeds an event to the playback state machine (player_fsm), publishes the new state and returns
+// the action the caller has to execute. audio_task is the only writer of the playback state, so the
+// read-step-write sequence cannot race. An invalid (state, event) pair changes nothing.
+static player_action_t fsm_dispatch(player_event_t event) {
+  playback_state_t current = player_state_get_playback();
+  player_transition_t transition = player_fsm_step(current, event);
+  if (!transition.valid) {
+    ESP_LOGW(TAG, "Event %s ignored in state %s", player_fsm_event_name(event),
+             player_fsm_state_name(current));
+    return PLAYER_ACT_NONE;
+  }
+  if (transition.next != current) {
+    ESP_LOGI(TAG, "Playback %s -> %s (%s)", player_fsm_state_name(current),
+             player_fsm_state_name(transition.next), player_fsm_event_name(event));
+    player_state_set_playback(transition.next);
+  }
+  return transition.action;
+}
+
+// A Next / Prev / Select command that really moved to another track becomes a state machine event.
+static player_action_t on_track_change(bool changed) {
+  return changed ? fsm_dispatch(PLAYER_EVT_TRACK_SELECTED) : PLAYER_ACT_NONE;
+}
+
+// Applies a command and returns the state machine action it caused. PLAYER_ACT_START_TRACK means
+// "stop the current stream and start the track at player_state's index".
+static player_action_t handle_cmd(const player_cmd_t* cmd) {
   switch (cmd->type) {
-    case CMD_PLAY_PAUSE: {
-      playback_state_t playback = player_state_get_playback();
-      if (playback == PLAYBACK_PLAYING) {
-        player_state_set_playback(PLAYBACK_PAUSED);
-        ESP_LOGI(TAG, "Playback paused");
-      } else if (playback == PLAYBACK_PAUSED) {
-        player_state_set_playback(PLAYBACK_PLAYING);
-        ESP_LOGI(TAG, "Playback resumed");
-      }
-      break;
-    }
+    case CMD_PLAY_PAUSE:
+      return fsm_dispatch(PLAYER_EVT_PLAY_PAUSE);
 
     // No wrap-around: at the list boundaries player_state ignores the
     // command (logs a warning) and the current track keeps playing.
     case CMD_NEXT:
-      return player_state_next_track();
+      return on_track_change(player_state_next_track());
 
     case CMD_PREV:
-      return player_state_prev_track();
+      return on_track_change(player_state_prev_track());
 
     case CMD_SELECT_TRACK:
       // An explicit selection restarts the track even if it is the current one.
-      return player_state_select_track(cmd->index) == ESP_OK;
+      return on_track_change(player_state_select_track(cmd->index) == ESP_OK);
 
     case CMD_VOLUME_UP:
     case CMD_VOLUME_DOWN: {
@@ -130,7 +146,7 @@ static bool handle_cmd(const player_cmd_t* cmd) {
       ESP_LOGW(TAG, "Unknown command type %d, ignored", cmd->type);
       break;
   }
-  return false;
+  return PLAYER_ACT_NONE;
 }
 
 typedef enum {
@@ -182,7 +198,7 @@ static void publish_progress(stream_ctx_t* ctx) {
 static stream_end_t wait_while_paused(void) {
   player_cmd_t cmd;
   if (xQueueReceive(s_cmd_queue, &cmd, pdMS_TO_TICKS(SD_POLL_PERIOD_MS)) == pdTRUE) {
-    return handle_cmd(&cmd) ? END_CHANGED : END_NONE;
+    return handle_cmd(&cmd) == PLAYER_ACT_START_TRACK ? END_CHANGED : END_NONE;
   }
   return sd_is_present() ? END_NONE : END_SD_REMOVED;
 }
@@ -239,7 +255,7 @@ static stream_end_t stream_until_end(stream_ctx_t* ctx) {
     // command (e.g. pause) doesn't wait for the decoder.
     player_cmd_t cmd;
     if (xQueueReceive(s_cmd_queue, &cmd, 0) == pdTRUE) {
-      if (handle_cmd(&cmd)) {
+      if (handle_cmd(&cmd) == PLAYER_ACT_START_TRACK) {
         end = END_CHANGED;
       }
       continue;  // the state may have changed (e.g. to PAUSED) — don't decode a block yet
@@ -299,9 +315,9 @@ static const char* format_name(audio_format_t format) {
 }
 
 // Streams the track at player_state's current index until it ends or a
-// command switches the track. Sets the state to PLAYING on entry (so a
-// track change also clears a pause); the caller sets STOPPED when there is
-// nothing more to play (TRACK_FINISHED, or TRACK_EOF on the last track).
+// command switches the track. Reports TRACK_STARTED to the state machine once
+// the file is open (so a track change also clears a pause); the caller reports
+// the end of the stream (EOF / failure / SD loss) the same way.
 static track_result_t stream_current_track(void) {
   char path[SD_MAX_NAME + PATH_EXTRA_CHARS];
   if (get_current_track_path(path, sizeof(path)) != ESP_OK) {
@@ -330,7 +346,7 @@ static track_result_t stream_current_track(void) {
     return TRACK_FINISHED;
   }
 
-  player_state_set_playback(PLAYBACK_PLAYING);
+  fsm_dispatch(PLAYER_EVT_TRACK_STARTED);
 
   track_result_t result = finish_stream(stream_until_end(&ctx), &ctx);
   audio_decoder_close(&ctx.decoder);
@@ -404,18 +420,22 @@ static void audio_task(void* arg) {
       if (result == TRACK_CHANGED) {
         continue;  // start_track stays true: open the newly selected track
       }
-      if (result == TRACK_SD_LOST) {
-        sd_resume_arm(&resume);
-      }
       // Auto-advance only after a real end of file, never after an error.
       if (result == TRACK_EOF) {
         if (player_state_next_track()) {
           ESP_LOGI(TAG, "Track ended, advancing to the next one");
-          continue;  // start_track stays true: open the next track
+          // The action keeps start_track true: open the next track.
+          start_track = fsm_dispatch(PLAYER_EVT_TRACK_EOF_NEXT) == PLAYER_ACT_START_TRACK;
+          continue;
         }
         ESP_LOGI(TAG, "Last track ended");
+        fsm_dispatch(PLAYER_EVT_TRACK_EOF_LAST);
+      } else if (result == TRACK_SD_LOST) {
+        sd_resume_arm(&resume);
+        fsm_dispatch(PLAYER_EVT_SD_LOST);
+      } else {
+        fsm_dispatch(PLAYER_EVT_TRACK_FAILED);
       }
-      player_state_set_playback(PLAYBACK_STOPPED);
       ESP_LOGI(TAG, "Playback stopped, waiting for commands");
       start_track = false;
       continue;
@@ -425,15 +445,15 @@ static void audio_task(void* arg) {
     //     the track length once the SD card is back ---
     if (xQueueReceive(s_cmd_queue, &cmd, pdMS_TO_TICKS(SD_POLL_PERIOD_MS)) == pdTRUE) {
       resume.pending = false;  // the user is in control now
-      bool track_changed = handle_cmd(&cmd);
-      if (sd_is_present() && (track_changed || cmd.type == CMD_PLAY_PAUSE)) {
-        start_track = true;  // track changed, or Play pressed — (re)start current track
+      // Track changed, or Play pressed — (re)start the current track if the card is there.
+      if (handle_cmd(&cmd) == PLAYER_ACT_START_TRACK && sd_is_present()) {
+        start_track = true;
       }
       continue;
     }
 
     if (sd_resume_due(&resume)) {
-      start_track = true;
+      start_track = fsm_dispatch(PLAYER_EVT_SD_RETURNED) == PLAYER_ACT_START_TRACK;
       continue;
     }
 
