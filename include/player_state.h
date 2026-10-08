@@ -4,8 +4,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
-
-typedef enum { PLAYBACK_STOPPED = 0, PLAYBACK_PLAYING, PLAYBACK_PAUSED } playback_state_t;
+#include "player_types.h"
 
 /** Atomic snapshot of the whole player state (for display / BLE tasks). */
 typedef struct {

@@ -1,5 +1,8 @@
 #pragma once
 
+/** Playback state shared by audio_task (the only writer), the display and BLE. */
+typedef enum { PLAYBACK_STOPPED = 0, PLAYBACK_PLAYING, PLAYBACK_PAUSED } playback_state_t;
+
 typedef enum {
   CMD_PLAY_PAUSE = 0,
   CMD_NEXT,
