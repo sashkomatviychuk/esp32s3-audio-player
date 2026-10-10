@@ -14,7 +14,7 @@
 
 static const char* TAG = "sd_card";
 
-// SD card / SPI2 bus (VS1053 has its own SPI3 bus) — matches hardware.md
+// SD card / SPI2 bus — matches hardware.md
 #define PIN_NUM_MISO 11
 #define PIN_NUM_MOSI 13
 #define PIN_NUM_CLK 12
@@ -60,8 +60,7 @@ static esp_err_t init_bus(void) {
       .max_transfer_sz = SPI_MAX_TRANSFER_SIZE,
   };
 
-  // SPI2 bus for the SD card only. VS1053 initializes its own SPI3 bus in
-  // vs1053_init(). The bus stays up when the card is removed, so re-mounting
+  // SPI2 bus for the SD card only. The bus stays up when the card is removed, so re-mounting
   // does not have to initialize it again.
   esp_err_t ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SDSPI_DEFAULT_DMA);
   if (ret != ESP_OK) {
@@ -93,9 +92,9 @@ esp_err_t sd_card_try_mount(void) {
                                                    .allocation_unit_size = SD_ALLOCATION_UNIT_SIZE};
 
   sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-  // The SD/VS1053 SPI bus runs on ~15-20cm breadboard wiring, which was
+  // The SD SPI bus runs on ~15-20cm breadboard wiring, which was
   // unreliable at the default 20MHz (see sd-card-issues.md for the full
-  // history). 1MHz was tried after fixing the VS1053 supply voltage, but
+  // history). 1MHz was tried but
   // it reintroduced the same failure: mount succeeds, then a data CRC
   // error shows up mid-stream (sdspi_host: data CRC failed) and aborts
   // the read. Back to 100kHz, the speed this wiring actually holds up at.

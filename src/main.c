@@ -13,21 +13,11 @@
 #include "player_state.h"
 #include "player_types.h"
 #include "sd_card.h"
-// #include "vs1053.h"  // VS1053 disabled, audio goes through the PCM5102 (I2S)
 
 static const char* TAG = "main";
 
 #define STARTUP_DELAY_MS 2000  // lets the serial monitor attach before the first logs
 #define CMD_QUEUE_LENGTH 10
-
-// VS1053 disabled: its log level setup is kept for when the driver comes back.
-// #if CONFIG_AUDIO_DEBUG_VS1053_LOG_DEBUG
-// #define VS1053_LOG_LEVEL ESP_LOG_DEBUG
-// #elif CONFIG_AUDIO_DEBUG_VS1053_LOG_INFO
-// #define VS1053_LOG_LEVEL ESP_LOG_INFO
-// #else
-// #define VS1053_LOG_LEVEL ESP_LOG_WARN
-// #endif
 
 #if CONFIG_AUDIO_DEBUG_SPI_MASTER_LOG_DEBUG
 #define SPI_MASTER_LOG_LEVEL ESP_LOG_DEBUG
@@ -41,22 +31,17 @@ void app_main(void) {
   vTaskDelay(pdMS_TO_TICKS(STARTUP_DELAY_MS));
   esp_log_level_set("ssd1306", ESP_LOG_WARN);
   esp_log_level_set("spi_master", SPI_MASTER_LOG_LEVEL);
-  // esp_log_level_set("VS1053", VS1053_LOG_LEVEL);
 
-  ESP_LOGI(TAG, "WAV player starting up");
-
-  // VS1053 disabled: it kept its XCS/XDCS pins deselected until vs1053_init().
-  // GPIO4/5/6 now belong to the PCM5102 (I2S LRCK/DIN/BCK).
-  // vs1053_deselect_early();
+  ESP_LOGI(TAG, "MP3/WAV player starting up");
 
   if (player_state_init() != ESP_OK) {
     ESP_LOGE(TAG, "player_state_init failed");
     return;
   }
 
-  // Shared resources for all tasks touching the SD card / VS1053:
+  // Shared resources for all tasks touching the SD card:
   // created here, in main.c, as the single owner, and passed in as
-  // parameters to sd_card_scan_tracks() / audio_task_init() / vs1053_init().
+  // parameters to sd_card_scan_tracks() / audio_task_init().
   QueueHandle_t cmd_queue = xQueueCreate(CMD_QUEUE_LENGTH, sizeof(player_cmd_t));
   SemaphoreHandle_t spi_mutex = xSemaphoreCreateMutex();
 
@@ -79,12 +64,6 @@ void app_main(void) {
     ESP_LOGE(TAG, "pcm5102_init failed");
     return;
   }
-
-  // VS1053 disabled; it initialized its own, separate SPI bus (SPI3) here.
-  // if (vs1053_init(spi_mutex) != ESP_OK) {
-  //   ESP_LOGE(TAG, "vs1053_init failed");
-  //   return;
-  // }
 
   // Scans the card now (if present) and then watches for insert / removal.
   if (sd_card_monitor_init(spi_mutex) != ESP_OK) {

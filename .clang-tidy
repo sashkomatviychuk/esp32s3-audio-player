@@ -39,7 +39,7 @@ CheckOptions:
   - key: readability-identifier-naming.StaticConstantIgnoredRegexp
     value: '^s_[a-z0-9_]+$'
 
-  # Macros and constants: UPPER_CASE (VS1053_PIN_CS, DISPLAY_WIDTH)
+  # Macros and constants: UPPER_CASE (SD_PIN_CS, DISPLAY_WIDTH)
   - key: readability-identifier-naming.MacroDefinitionCase
     value: UPPER_CASE
   - key: readability-identifier-naming.EnumConstantCase

@@ -12,7 +12,7 @@ static const char* TAG = "player_state";
 #define VOLUME_MAX 100
 
 // Guards s_state only. Held just long enough to copy a few fields — never
-// held across SPI / VS1053 / SD calls, so it cannot deadlock with spi_mutex.
+// held across SPI / SD calls, so it cannot deadlock with spi_mutex.
 static SemaphoreHandle_t s_state_mutex = NULL;
 static player_state_t s_state = {
     .playback = PLAYBACK_STOPPED, .volume = INITIAL_VOLUME, .track_index = 0, .track_count = 0,

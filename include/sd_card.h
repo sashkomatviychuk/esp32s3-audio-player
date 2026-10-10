@@ -14,8 +14,6 @@
 /**
  * @brief Initializes the SD card's SPI bus (SPI2) and mounts the card (FAT32).
  *
- * The (disabled) VS1053 used its own separate bus (SPI3); the PCM5102 uses I2S, no SPI.
- *
  * Locking: takes no mutex — call it before any task that uses the card
  * is created.
  *
@@ -64,7 +62,7 @@ const char* sd_card_get_mount_point(void);
  *        via player_state_set_track_count().
  *
  * Locking: takes @p spi_mutex internally for the duration of the scan
- * (the SD card shares the bus with the VS1053) — call WITHOUT holding it.
+ * (the bus is shared with other SPI users) — call WITHOUT holding it.
  *
  * @param spi_mutex Mutex protecting the shared SPI bus
  *
