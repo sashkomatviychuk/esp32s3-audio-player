@@ -14,7 +14,7 @@
 
 static const char* TAG = "sd_card";
 
-// SD card / SPI2 bus — matches hardware.md
+// SD card / SPI2 bus
 #define PIN_NUM_MISO 11
 #define PIN_NUM_MOSI 13
 #define PIN_NUM_CLK 12
@@ -92,12 +92,9 @@ esp_err_t sd_card_try_mount(void) {
                                                    .allocation_unit_size = SD_ALLOCATION_UNIT_SIZE};
 
   sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-  // The SD SPI bus runs on ~15-20cm breadboard wiring, which was
-  // unreliable at the default 20MHz (see sd-card-issues.md for the full
-  // history). 1MHz was tried but
-  // it reintroduced the same failure: mount succeeds, then a data CRC
-  // error shows up mid-stream (sdspi_host: data CRC failed) and aborts
-  // the read. Back to 100kHz, the speed this wiring actually holds up at.
+  // The SD SPI bus runs on ~15-20cm breadboard wiring, which was unreliable at the
+  // default 20MHz: mount succeeds, then a data CRC error shows up mid-stream
+  // (sdspi_host: data CRC failed) and aborts the read. 4MHz is the speed this wiring holds up at.
   host.max_freq_khz = SD_MAX_FREQ_KHZ;
   // IMPORTANT: do NOT set SDMMC_HOST_FLAG_SPI_IGNORE_DATA_CRC. It was tried
   // earlier to work around what looked like a bad CID/CSD checksum, but it
@@ -115,8 +112,8 @@ esp_err_t sd_card_try_mount(void) {
   slot_config.wait_for_miso = SD_WAIT_FOR_MISO_MS;
 
   // The CSD (capacity) is read correctly now that data CRC is enforced — the
-  // earlier "512KB" CSD was an artifact of SDMMC_HOST_FLAG_SPI_IGNORE_DATA_CRC
-  // (see sd-card-issues.md), so the public mount helper is enough.
+  // earlier "512KB" CSD was an artifact of SDMMC_HOST_FLAG_SPI_IGNORE_DATA_CRC,
+  // so the public mount helper is enough.
   sdmmc_card_t* card = NULL;
   ret = esp_vfs_fat_sdspi_mount(MOUNT_POINT, &host, &slot_config, &mount_config, &card);
   if (ret != ESP_OK) {
