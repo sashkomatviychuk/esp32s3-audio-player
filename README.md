@@ -60,6 +60,7 @@ No sound or something not working? See [troubleshooting](docs/usage.md#troublesh
 | [docs/hardware.md](docs/hardware.md) | Parts, pin map, schematic, wiring notes (PCM5102, SD card) |
 | [docs/usage.md](docs/usage.md) | Controls, BLE protocol, menuconfig options, troubleshooting |
 | [docs/architecture.md](docs/architecture.md) | Modules, data flow, playback state machine, design decisions |
+| [docs/audio-pipeline.md](docs/audio-pipeline.md) | How MP3 / WAV are decoded and sent to the DAC over I2S, in plain words |
 | [docs/development.md](docs/development.md) | Tool versions, build, host tests, code style, references |
 | [docs/lessons.md](docs/lessons.md) | Results, lessons learned, limitations, roadmap |
 

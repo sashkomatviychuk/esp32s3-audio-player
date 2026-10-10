@@ -16,6 +16,8 @@ flowchart LR
     STATE -->|snapshot every 250 ms| DISP[display_task<br/>SSD1306]
 ```
 
+The path from a file to sound is explained step by step in [audio-pipeline.md](audio-pipeline.md).
+
 ## Modules
 
 | Module | Responsibility |
